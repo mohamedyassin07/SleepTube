@@ -20,6 +20,7 @@ data class VideoItem(
     val mime: String,
     val modified: Long,
     val size: Long,
+    val dir: String? = null,
 ) {
     val key: String get() = uri.toString()
     val isAudio: Boolean
@@ -27,10 +28,24 @@ data class VideoItem(
             name.substringAfterLast('.', "").lowercase() in VideoRepo.AUDIO_EXT
 }
 
+/** A subfolder of the chosen folder (playlist downloads go into one each). */
+data class FolderItem(
+    val docId: String,
+    val name: String,
+    val uri: Uri,
+    val videos: List<VideoItem>,
+) {
+    val key: String get() = "dir:$docId"
+    val count: Int get() = videos.size
+}
+
 object VideoRepo {
     val VIDEO_EXT = setOf("mp4", "webm", "mkv", "3gp", "mov", "m4v", "avi", "ts")
     val AUDIO_EXT = setOf("m4a", "mp3", "opus", "ogg", "aac", "wav", "flac", "weba")
     private val ID_SUFFIX = Regex("""\s*\[([A-Za-z0-9_-]{11})]$""")
+    private val INDEX_PREFIX = Regex("""^\d{1,4} - """)
+    private val BAD_CHARS = Regex("""[\\/:*?"<>|\p{Cntrl}]""")
+    private val SPACES = Regex("""\s+""")
 
     private val memCache = object : LruCache<String, Bitmap>(16 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
@@ -61,9 +76,16 @@ object VideoRepo {
         } catch (_: Exception) { null } ?: folder.lastPathSegment
     }
 
-    fun titleOf(fileName: String): String {
+    fun titleOf(fileName: String, inFolder: Boolean = false): String {
         val base = fileName.substringBeforeLast('.', fileName)
-        return base.replace(ID_SUFFIX, "").trim()
+        val t = base.replace(ID_SUFFIX, "").trim()
+        return if (inFolder) t.replace(INDEX_PREFIX, "").trim() else t
+    }
+
+    /** Folder-name-safe version of a playlist title. */
+    fun sanitizeName(name: String): String {
+        val t = name.replace(BAD_CHARS, " ").replace(SPACES, " ").trim().trim('.').take(80).trim()
+        return t.ifEmpty { "Playlist" }
     }
 
     fun idOf(fileName: String): String? {
@@ -78,14 +100,14 @@ object VideoRepo {
         return ext in VIDEO_EXT || ext in AUDIO_EXT
     }
 
-    /** Lists media files in the chosen folder, oldest first. */
-    fun list(ctx: Context): List<VideoItem> {
-        val tree = Prefs.folderUri ?: return emptyList()
-        val out = ArrayList<VideoItem>()
+    private class Row(val docId: String, val name: String, val mime: String, val modified: Long, val size: Long)
+
+    private fun rootDocId(tree: Uri): String = DocumentsContract.getTreeDocumentId(tree)
+
+    private fun queryChildren(ctx: Context, tree: Uri, parentDocId: String): List<Row> {
+        val out = ArrayList<Row>()
         try {
-            val children = DocumentsContract.buildChildDocumentsUriUsingTree(
-                tree, DocumentsContract.getTreeDocumentId(tree)
-            )
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentDocId)
             val cols = arrayOf(
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME,
@@ -97,49 +119,92 @@ object VideoRepo {
                 while (c.moveToNext()) {
                     val docId = c.getString(0) ?: continue
                     val name = c.getString(1) ?: continue
-                    val mime = c.getString(2) ?: ""
-                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
-                    if (!isMedia(name, mime)) continue
-                    val modified = if (c.isNull(3)) 0L else c.getLong(3)
-                    val size = if (c.isNull(4)) 0L else c.getLong(4)
-                    val uri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
-                    out.add(VideoItem(uri, name, titleOf(name), idOf(name), mime, modified, size))
+                    out.add(
+                        Row(
+                            docId, name, c.getString(2) ?: "",
+                            if (c.isNull(3)) 0L else c.getLong(3),
+                            if (c.isNull(4)) 0L else c.getLong(4),
+                        )
+                    )
                 }
             }
         } catch (_: Exception) {
         }
-        out.sortWith(compareBy<VideoItem>({ it.modified }, { it.name }))
         return out
     }
 
-    fun existsId(ctx: Context, id: String): Boolean {
-        val tree = Prefs.folderUri ?: return false
-        val tag = "[$id]"
-        try {
-            val children = DocumentsContract.buildChildDocumentsUriUsingTree(
-                tree, DocumentsContract.getTreeDocumentId(tree)
-            )
-            ctx.contentResolver.query(
-                children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
-            )?.use { c ->
-                while (c.moveToNext()) {
-                    val n = c.getString(0) ?: continue
-                    if (n.contains(tag) && !n.endsWith(".part")) return true
-                }
+    private fun isDir(r: Row) = r.mime == DocumentsContract.Document.MIME_TYPE_DIR
+
+    private fun mediaOf(tree: Uri, rows: List<Row>, dir: String?): List<VideoItem> =
+        rows.filter { !isDir(it) && isMedia(it.name, it.mime) }
+            .map {
+                VideoItem(
+                    DocumentsContract.buildDocumentUriUsingTree(tree, it.docId),
+                    it.name, titleOf(it.name, dir != null), idOf(it.name), it.mime, it.modified, it.size, dir
+                )
             }
-        } catch (_: Exception) {
-        }
-        return false
+
+    private fun sortRoot(items: List<VideoItem>) =
+        items.sortedWith(compareBy<VideoItem>({ it.modified }, { it.name }))
+
+    private fun sortFolder(items: List<VideoItem>) =
+        items.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it: VideoItem -> it.name })
+
+    /**
+     * Media files directly in the chosen folder (dir = null; oldest first = download order)
+     * or in a subfolder (sorted by name = playlist order thanks to the "001 - " prefix).
+     */
+    fun list(ctx: Context, dir: String? = null): List<VideoItem> {
+        val tree = Prefs.folderUri ?: return emptyList()
+        val items = mediaOf(tree, queryChildren(ctx, tree, dir ?: rootDocId(tree)), dir)
+        return if (dir == null) sortRoot(items) else sortFolder(items)
     }
 
-    /** Copies [file] into the chosen folder keeping its file name. Returns the new document uri. */
-    fun saveToFolder(ctx: Context, file: File): Uri {
+    /** Subfolders that contain media (sorted by name) and the root videos. */
+    fun listAll(ctx: Context): Pair<List<FolderItem>, List<VideoItem>> {
+        val tree = Prefs.folderUri ?: return Pair(emptyList(), emptyList())
+        val rows = queryChildren(ctx, tree, rootDocId(tree))
+        val folders = rows.filter { isDir(it) && !it.name.startsWith(".") }
+            .map { r ->
+                FolderItem(
+                    r.docId, r.name, DocumentsContract.buildDocumentUriUsingTree(tree, r.docId),
+                    list(ctx, r.docId)
+                )
+            }
+            .filter { it.count > 0 }
+            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it: FolderItem -> it.name })
+        return Pair(folders, sortRoot(mediaOf(tree, rows, null)))
+    }
+
+    /** Finds a subfolder of the chosen folder by display name, or creates it. Returns its document id. */
+    @Synchronized
+    fun findOrCreateSubfolder(ctx: Context, name: String): String {
         val tree = Prefs.folderUri ?: throw IllegalStateException("no folder")
-        val parent = DocumentsContract.buildDocumentUriUsingTree(
-            tree, DocumentsContract.getTreeDocumentId(tree)
-        )
+        val root = rootDocId(tree)
+        queryChildren(ctx, tree, root)
+            .firstOrNull { isDir(it) && it.name.equals(name, ignoreCase = true) }
+            ?.let { return it.docId }
+        val parent = DocumentsContract.buildDocumentUriUsingTree(tree, root)
+        val uri = DocumentsContract.createDocument(
+            ctx.contentResolver, parent, DocumentsContract.Document.MIME_TYPE_DIR, name
+        ) ?: throw IllegalStateException("createDocument(dir) failed")
+        return DocumentsContract.getDocumentId(uri)
+    }
+
+    /** True if a file containing "[id]" exists in the target folder (root when dir == null). */
+    fun existsId(ctx: Context, id: String, dir: String? = null): Boolean {
+        val tree = Prefs.folderUri ?: return false
+        val tag = "[$id]"
+        return queryChildren(ctx, tree, dir ?: rootDocId(tree))
+            .any { !isDir(it) && it.name.contains(tag) && !it.name.endsWith(".part") }
+    }
+
+    /** Copies [file] into the target folder as [displayName]. Returns the new document uri. */
+    fun saveToFolder(ctx: Context, file: File, dir: String? = null, displayName: String = file.name): Uri {
+        val tree = Prefs.folderUri ?: throw IllegalStateException("no folder")
+        val parent = DocumentsContract.buildDocumentUriUsingTree(tree, dir ?: rootDocId(tree))
         val cr = ctx.contentResolver
-        val uri = DocumentsContract.createDocument(cr, parent, "application/octet-stream", file.name)
+        val uri = DocumentsContract.createDocument(cr, parent, "application/octet-stream", displayName)
             ?: throw IllegalStateException("createDocument failed")
         try {
             cr.openOutputStream(uri, "w")?.use { os ->
@@ -150,6 +215,20 @@ object VideoRepo {
             throw e
         }
         return uri
+    }
+
+    /** Deletes a subfolder with everything in it. */
+    fun deleteFolder(ctx: Context, folder: FolderItem): Boolean {
+        folder.videos.forEach {
+            Prefs.forget(it.key)
+            memCache.remove(it.key)
+            thumbFile(ctx, it).delete()
+        }
+        val ok = try {
+            DocumentsContract.deleteDocument(ctx.contentResolver, folder.uri)
+        } catch (_: Exception) { false }
+        if (!ok) folder.videos.forEach { delete(ctx, it) } // fall back to file by file
+        return ok
     }
 
     fun delete(ctx: Context, item: VideoItem): Boolean {

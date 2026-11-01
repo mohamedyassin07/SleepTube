@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
 import org.json.JSONArray
+import org.json.JSONObject
 
 object Prefs {
     private lateinit var sp: SharedPreferences
@@ -79,53 +80,87 @@ object Prefs {
     }
 
     // ---- persisted download queue ----
-    private fun readQueue(): MutableList<String> {
+    // Format: JSON array of {"u": url, "d": subfolder document id or absent, "i": playlist index}.
+    // Older builds stored plain URL strings; those are read as root-folder entries.
+    private fun readQueue(): MutableList<QueueItem> {
         val arr = try { JSONArray(sp.getString(K_QUEUE, "[]")) } catch (e: Exception) { JSONArray() }
-        val out = ArrayList<String>(arr.length())
-        for (i in 0 until arr.length()) out.add(arr.optString(i))
+        val out = ArrayList<QueueItem>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.opt(i)
+            when (o) {
+                is JSONObject -> {
+                    val u = o.optString("u")
+                    if (u.isNotEmpty()) out.add(
+                        QueueItem(u, o.optString("d").ifEmpty { null }, o.optInt("i", 0), o.optInt("n", 0))
+                    )
+                }
+                is String -> if (o.isNotEmpty()) out.add(QueueItem(o))
+            }
+        }
         return out
     }
 
-    private fun writeQueue(list: List<String>) {
+    /** Returns false if the write did not reach disk. */
+    private fun writeQueue(list: List<QueueItem>): Boolean {
         val arr = JSONArray()
-        list.forEach { arr.put(it) }
-        sp.edit().putString(K_QUEUE, arr.toString()).commit()
+        list.forEach {
+            val o = JSONObject().put("u", it.url)
+            if (it.dir != null) o.put("d", it.dir)
+            if (it.index > 0) o.put("i", it.index)
+            if (it.total > 0) o.put("n", it.total)
+            arr.put(o)
+        }
+        return sp.edit().putString(K_QUEUE, arr.toString()).commit()
     }
 
-    @Synchronized fun queue(): List<String> = readQueue()
+    @Synchronized fun queue(): List<QueueItem> = readQueue()
 
     @Synchronized fun queueSize(): Int = readQueue().size
 
-    @Synchronized fun queueHead(): String? = readQueue().firstOrNull()
+    @Synchronized fun queueHead(): QueueItem? = readQueue().firstOrNull()
 
-    /** Adds url if not already queued. Returns true if added. */
-    @Synchronized fun enqueue(url: String): Boolean {
+    /** Adds the item if the same url/target is not already queued. Returns true if added. */
+    @Synchronized fun enqueue(item: QueueItem): Boolean {
         val q = readQueue()
-        if (q.contains(url)) return false
-        q.add(url)
-        writeQueue(q)
-        return true
+        if (q.any { it.url == item.url && it.dir == item.dir }) return false
+        q.add(item)
+        return writeQueue(q)
     }
 
-    @Synchronized fun removeHead(expected: String) {
+    /**
+     * Removes [expected] (normally the head). Returns true if it is no longer in the queue
+     * afterwards, false if the queue could not be advanced (write failed).
+     */
+    @Synchronized fun removeHead(expected: QueueItem): Boolean {
         val q = readQueue()
-        if (q.isNotEmpty() && q[0] == expected) q.removeAt(0) else q.remove(expected)
+        val idx = q.indexOf(expected)
+        if (idx < 0) return true
+        q.removeAt(idx)
         writeQueue(q)
+        return expected !in readQueue()
     }
 
-    /** Replaces url (playlist) with its expanded list, in place. */
-    @Synchronized fun replace(url: String, items: List<String>) {
+    /** Replaces [entry] (a playlist) with its expanded items, in place. */
+    @Synchronized fun replace(entry: QueueItem, items: List<QueueItem>): Boolean {
         val q = readQueue()
-        val idx = q.indexOf(url)
-        val fresh = items.distinct().filter { it !in q }
+        val idx = q.indexOf(entry)
+        val fresh = items.distinct().filter { n -> q.none { it.url == n.url && it.dir == n.dir } }
         if (idx >= 0) {
             q.removeAt(idx)
             q.addAll(idx, fresh)
         } else {
             q.addAll(0, fresh)
         }
-        writeQueue(q)
+        return writeQueue(q)
     }
 
-    @Synchronized fun clearQueue() = writeQueue(emptyList())
+    @Synchronized fun clearQueue() { writeQueue(emptyList()) }
 }
+
+/** One download job. [dir] = document id of the target subfolder (null = chosen folder root). */
+data class QueueItem(
+    val url: String,
+    val dir: String? = null,
+    val index: Int = 0,
+    val total: Int = 0,
+)

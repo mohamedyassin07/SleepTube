@@ -22,6 +22,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
@@ -86,6 +87,8 @@ class PlayerActivity : ComponentActivity() {
             controller = c
             playerView.player = c
             c.addListener(playerListener)
+            // A previous PlayerActivity may have turned video off when it went away.
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) setVideoEnabled(true)
             pendingIntent?.let { handleSelection(it) }
             pendingIntent = null
             updatePipParams()
@@ -218,8 +221,31 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        setVideoEnabled(true)
+    }
+
+    /**
+     * Battery: with no visible surface (screen locked, app in background, player closed while
+     * audio continues) ExoPlayer would keep decoding video into a placeholder surface. Turning
+     * the video track type off stops that; turning it back on re-selects the video track at the
+     * current position (no position jump). PiP keeps video.
+     */
+    private fun setVideoEnabled(enabled: Boolean) {
+        val c = controller ?: return
+        if (!c.isCommandAvailable(Player.COMMAND_SET_TRACK_SELECTION_PARAMETERS)) return
+        val p = c.trackSelectionParameters
+        val isDisabled = C.TRACK_TYPE_VIDEO in p.disabledTrackTypes
+        if (isDisabled == !enabled) return
+        c.trackSelectionParameters = p.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, !enabled)
+            .build()
+    }
+
     override fun onStop() {
         super.onStop()
+        if (!isChangingConfigurations && !isInPictureInPictureMode) setVideoEnabled(false)
         // Fallback for devices that report the PiP mode change before onStop on dismissal.
         if (!isInPictureInPictureMode && leftPipAt != 0L &&
             android.os.SystemClock.elapsedRealtime() - leftPipAt < 1500
@@ -262,6 +288,7 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onDestroy() {
         SleepTimer.playerInPip = false
+        if (!isChangingConfigurations) setVideoEnabled(false)
         controller?.removeListener(playerListener)
         playerView.player = null
         controllerFuture?.let { MediaController.releaseFuture(it) }

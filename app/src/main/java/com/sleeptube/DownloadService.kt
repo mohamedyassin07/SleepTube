@@ -1,6 +1,5 @@
 package com.sleeptube
 
-import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -11,7 +10,9 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
@@ -52,6 +53,9 @@ class DownloadService : Service() {
 
     @Volatile private var currentProcessId: String? = null
     @Volatile private var cancelCurrent = false
+    @Volatile private var stopRequested = false
+    private var startRequestedWhileRunning = false // main thread only
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var lastNotifyAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -74,6 +78,7 @@ class DownloadService : Service() {
                 Prefs.clearQueue()
                 cancelRunning()
             }
+            else -> if (loopRunning) startRequestedWhileRunning = true
         }
         ensureLoop()
         return START_NOT_STICKY
@@ -93,18 +98,27 @@ class DownloadService : Service() {
 
     /** Main thread. Starts the worker loop unless it is already running. */
     private fun ensureLoop() {
-        if (loopRunning) return
+        if (loopRunning || stopRequested) return
         if (Prefs.queueHead() == null) {
             finish()
             return
         }
         loopRunning = true
+        startRequestedWhileRunning = false
         scope.launch {
-            withContext(Dispatchers.IO) { runQueue() }
+            val halted = withContext(Dispatchers.IO) {
+                try { runQueue() } finally { releaseLocks() }
+            }
             // Back on main thread: onStartCommand also runs here, so no enqueue can slip between
             // this check and stopSelf().
             loopRunning = false
-            if (Prefs.queueHead() != null && VideoRepo.hasFolderAccess(this@DownloadService)) {
+            val newRequest = startRequestedWhileRunning
+            startRequestedWhileRunning = false
+            // After a halt (init failure, repeated failures, queue write failure) only a new
+            // enqueue may restart the loop; otherwise it could spin forever holding locks.
+            if (!stopRequested && (!halted || newRequest) &&
+                Prefs.queueHead() != null && VideoRepo.hasFolderAccess(this@DownloadService)
+            ) {
                 ensureLoop()
             } else {
                 finish()
@@ -119,66 +133,80 @@ class DownloadService : Service() {
         stopSelf()
     }
 
-    @SuppressLint("WakelockTimeout")
+    /** (Re)acquires the locks for one URL, each bounded by [LOCK_TIMEOUT_MS]. */
     private fun acquireLocks() {
-        if (wakeLock == null) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SleepTube:download").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val wl = wakeLock ?: pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SleepTube:download").apply {
+            setReferenceCounted(false)
+            wakeLock = this
         }
-        if (wifiLock == null) {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            @Suppress("DEPRECATION")
-            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SleepTube:download").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
+        wl.acquire(LOCK_TIMEOUT_MS) // non reference-counted: re-acquiring just restarts the timeout
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val wf = wifiLock ?: wm.createWifiLock(WifiManager.WIFI_MODE_FULL, "SleepTube:download").apply {
+            setReferenceCounted(false)
+            wifiLock = this
         }
+        if (!wf.isHeld) wf.acquire()
+        // WifiLock has no timeout API: release it ourselves when the per-URL budget runs out.
+        mainHandler.removeCallbacks(lockTimeout)
+        mainHandler.postDelayed(lockTimeout, LOCK_TIMEOUT_MS)
     }
 
+    private val lockTimeout = Runnable { releaseLocks() }
+
     private fun releaseLocks() {
+        mainHandler.removeCallbacks(lockTimeout)
         try { wakeLock?.takeIf { it.isHeld }?.release() } catch (_: Throwable) {}
         try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Throwable) {}
-        wakeLock = null
-        wifiLock = null
     }
 
     // ------------------------------------------------------------------ worker (IO thread)
 
-    private fun runQueue() {
+    /** Processes the queue. Returns true if it stopped early (halted), false if the queue drained. */
+    private fun runQueue(): Boolean {
         acquireLocks()
         try {
             Ytdl.init(this)
         } catch (e: Throwable) {
             notifyResult("فشل تجهيز yt-dlp", e.message ?: "")
-            return
+            return true
         }
         Ytdl.updateIfStale(this, 24 * 3600_000L)
-        while (true) {
-            val url = Prefs.queueHead() ?: break
+        var failures = 0
+        while (!stopRequested) {
+            val item = Prefs.queueHead() ?: return false
             if (!VideoRepo.hasFolderAccess(this)) {
                 notifyResult("اختار فولدر التحميل", "افتح التطبيق واختار الفولدر")
-                break
+                return true
             }
+            acquireLocks()
             cancelCurrent = false
-            try {
-                processUrl(url)
+            val ok = try {
+                processItem(item)
             } catch (e: Throwable) {
-                notifyResult("فشل التحميل", e.message?.take(200) ?: url)
+                notifyResult("فشل التحميل", e.message?.take(200) ?: item.url)
+                false
             }
-            Prefs.removeHead(url)
+            if (!Prefs.removeHead(item)) {
+                notifyResult("فشل التحميل", "مقدرتش أحدث طابور التحميل")
+                return true
+            }
+            if (ok) {
+                failures = 0
+            } else if (++failures >= MAX_CONSECUTIVE_FAILURES) {
+                notifyResult("وقف التحميل", "$failures محاولات فشلت ورا بعض. هيكمل لما تضيف لينك جديد أو تفتح التطبيق.")
+                return true
+            }
         }
+        return true
     }
 
-    private fun processUrl(url: String) {
-        if (isPlaylistUrl(url)) {
-            expandPlaylist(url)
-            return
-        }
+    /** Returns false on failure; true on success, skip (already exists) or cancel. */
+    private fun processItem(item: QueueItem): Boolean {
+        val url = item.url
+        if (item.index == 0 && isPlaylistUrl(url)) return expandPlaylist(item)
         val vid = videoIdOf(url)
-        if (vid != null && VideoRepo.existsId(this, vid)) return
+        if (vid != null && VideoRepo.existsId(this, vid, item.dir)) return true
 
         updateState(DlState(true, vid ?: url, 0f, -1, Prefs.queueSize()), force = true)
         val tmp = File(cacheDir, "dl/" + SystemClock.elapsedRealtime()).apply {
@@ -193,9 +221,9 @@ class DownloadService : Service() {
                     ok = true
                     break
                 } catch (e: YoutubeDL.CanceledException) {
-                    return
+                    return true
                 } catch (e: Throwable) {
-                    if (cancelCurrent) return
+                    if (cancelCurrent) return true
                     lastError = e
                     if (attempt == 0 && System.currentTimeMillis() - Prefs.lastUpdate > 3600_000L) {
                         updateState(_state.value.copy(title = "بيحدث yt-dlp…"), force = true)
@@ -204,24 +232,30 @@ class DownloadService : Service() {
                     } else break
                 }
             }
-            if (cancelCurrent) return
+            if (cancelCurrent) return true
             if (!ok) {
                 notifyResult("فشل التحميل", shortError(lastError) ?: url)
-                return
+                return false
             }
             val file = tmp.listFiles()
                 ?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
                 ?.maxByOrNull { it.length() }
                 ?: run {
                     notifyResult("فشل التحميل", "مفيش ملف اتحمل")
-                    return
+                    return false
                 }
             val id = VideoRepo.idOf(file.name)
-            if (id != null && VideoRepo.existsId(this, id)) return
-            updateState(_state.value.copy(title = VideoRepo.titleOf(file.name), progress = 100f), force = true)
-            VideoRepo.saveToFolder(this, file)
+            if (id != null && VideoRepo.existsId(this, id, item.dir)) return true
+            val title = VideoRepo.titleOf(file.name)
+            val displayName = if (item.dir != null && item.index > 0) {
+                val width = maxOf(3, item.total.toString().length)
+                item.index.toString().padStart(width, '0') + " - " + file.name
+            } else file.name
+            updateState(_state.value.copy(title = title, progress = 100f), force = true)
+            VideoRepo.saveToFolder(this, file, item.dir, displayName)
             _changed.tryEmit(Unit)
-            notifyResult("خلص التحميل", VideoRepo.titleOf(file.name))
+            notifyResult("خلص التحميل", title)
+            return true
         } finally {
             tmp.deleteRecursively()
         }
@@ -261,9 +295,10 @@ class DownloadService : Service() {
         }
     }
 
-    private fun expandPlaylist(url: String) {
+    /** Expands a playlist into its own subfolder, keeping playlist order. */
+    private fun expandPlaylist(item: QueueItem): Boolean {
         updateState(DlState(true, "بيجيب الفيديوهات من البلاي ليست…", -1f, -1, Prefs.queueSize()), force = true)
-        val req = YoutubeDLRequest(url)
+        val req = YoutubeDLRequest(item.url)
         req.addOption("--flat-playlist")
         req.addOption("--yes-playlist")
         req.addOption("-J")
@@ -272,11 +307,11 @@ class DownloadService : Service() {
         val out = try {
             YoutubeDL.getInstance().execute(req, pid).out
         } catch (e: YoutubeDL.CanceledException) {
-            return
+            return true
         } finally {
             currentProcessId = null
         }
-        if (cancelCurrent) return
+        if (cancelCurrent) return true
         val urls = ArrayList<String>()
         val root = JSONObject(out.substring(out.indexOf('{')))
         val entries = root.optJSONArray("entries")
@@ -292,13 +327,20 @@ class DownloadService : Service() {
                 }
             }
         }
-        if (urls.isEmpty()) {
+        val unique = urls.distinct()
+        if (unique.isEmpty()) {
             notifyResult("فشل التحميل", "البلاي ليست فاضية")
-            return
+            return false
         }
-        // Puts the videos where the playlist was. The caller's removeHead(url) is then a no-op.
-        Prefs.replace(url, urls)
-        notifyResult("اتضافت البلاي ليست", "${urls.size} فيديو")
+        val title = root.optString("title").ifBlank { root.optString("id") }
+        val folderName = VideoRepo.sanitizeName(title)
+        val dir = VideoRepo.findOrCreateSubfolder(this, folderName)
+        val jobs = unique.mapIndexed { i, u -> QueueItem(u, dir, i + 1, unique.size) }
+        // Puts the videos where the playlist was. The caller's removeHead(item) is then a no-op.
+        if (!Prefs.replace(item, jobs)) return false
+        _changed.tryEmit(Unit)
+        notifyResult("اتضافت البلاي ليست", "$folderName • ${unique.size} فيديو")
+        return true
     }
 
     // ------------------------------------------------------------------ notifications
@@ -373,11 +415,13 @@ class DownloadService : Service() {
 
     override fun onTimeout(startId: Int) {
         // Android 15 dataSync time limit.
+        stopRequested = true
         cancelRunning()
         finish()
     }
 
     override fun onDestroy() {
+        stopRequested = true
         cancelRunning()
         releaseLocks()
         scope.cancel()
@@ -391,6 +435,8 @@ class DownloadService : Service() {
         private const val ACTION_CANCEL = "com.sleeptube.CANCEL"
         private const val ACTION_CANCEL_ALL = "com.sleeptube.CANCEL_ALL"
         private const val NOTIF_PROGRESS = 1001
+        private const val LOCK_TIMEOUT_MS = 60 * 60 * 1000L
+        private const val MAX_CONSECUTIVE_FAILURES = 3
         private val counter = AtomicInteger(0)
         private val resultIds = AtomicInteger(2000)
 

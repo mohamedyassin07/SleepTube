@@ -37,7 +37,7 @@ class ShareActivity : Activity() {
         }
         if (!VideoRepo.hasFolderAccess(this)) {
             // Keep it in the persisted queue; MainActivity starts the download after a folder is picked.
-            Prefs.enqueue(url)
+            Prefs.enqueue(QueueItem(url))
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -45,7 +45,7 @@ class ShareActivity : Activity() {
             Toast.makeText(this, "اختار فولدر التحميل الأول", Toast.LENGTH_SHORT).show()
             return
         }
-        Prefs.enqueue(url)
+        Prefs.enqueue(QueueItem(url))
         DownloadService.start(this)
         Toast.makeText(this, "اتضاف للتحميل", Toast.LENGTH_SHORT).show()
     }

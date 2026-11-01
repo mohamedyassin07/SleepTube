@@ -36,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
@@ -127,7 +128,7 @@ class MainActivity : ComponentActivity() {
     private fun consumePendingUrl() {
         val p = Prefs.pendingUrl ?: return
         Prefs.pendingUrl = null
-        Prefs.enqueue(p)
+        Prefs.enqueue(QueueItem(p))
         DownloadService.start(this)
         Toast.makeText(this, "اتضاف للتحميل", Toast.LENGTH_SHORT).show()
     }
@@ -200,11 +201,22 @@ class MainActivity : ComponentActivity() {
         val ctx = LocalContext.current
         val scope = rememberCoroutineScope()
         val tick by refreshTick
+        // Root view: playlist folders first, then root videos. Folder view: that folder's videos.
+        var openDir by remember { mutableStateOf<String?>(null) }
+        var openName by remember { mutableStateOf("") }
+        val folders = remember { mutableStateListOf<FolderItem>() }
         val items = remember { mutableStateListOf<VideoItem>() }
-        LaunchedEffect(tick) {
-            val list = withContext(Dispatchers.IO) { VideoRepo.list(ctx) }
-            items.clear()
-            items.addAll(list)
+        LaunchedEffect(tick, openDir) {
+            val dir = openDir
+            if (dir == null) {
+                val (f, v) = withContext(Dispatchers.IO) { VideoRepo.listAll(ctx) }
+                folders.clear(); folders.addAll(f)
+                items.clear(); items.addAll(v)
+            } else {
+                val v = withContext(Dispatchers.IO) { VideoRepo.list(ctx, dir) }
+                folders.clear()
+                items.clear(); items.addAll(v)
+            }
         }
         val selected = remember { mutableStateListOf<String>() }
         val selecting = selected.isNotEmpty()
@@ -212,15 +224,26 @@ class MainActivity : ComponentActivity() {
         val remaining by SleepTimer.remaining.collectAsState()
         val dl by DownloadService.state.collectAsState()
 
+        fun toggle(key: String) {
+            if (key in selected) selected.remove(key) else selected.add(key)
+        }
+
         BackHandler(enabled = selecting) { selected.clear() }
+        BackHandler(enabled = !selecting && openDir != null) { openDir = null }
 
         Scaffold(
             topBar = {
                 TopAppBar(
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
                     navigationIcon = {
-                        if (selecting) IconButton(onClick = { selected.clear() }) {
-                            Icon(Icons.Filled.Close, contentDescription = "إلغاء التحديد")
+                        if (selecting) {
+                            IconButton(onClick = { selected.clear() }) {
+                                Icon(Icons.Filled.Close, contentDescription = "إلغاء التحديد")
+                            }
+                        } else if (openDir != null) {
+                            IconButton(onClick = { openDir = null }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "رجوع")
+                            }
                         }
                     },
                     title = {
@@ -228,7 +251,10 @@ class MainActivity : ComponentActivity() {
                             Text("${selected.size} متحدد")
                         } else {
                             Column {
-                                Text("SleepTube")
+                                Text(
+                                    if (openDir != null) openName else "SleepTube",
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
                                 if (remaining >= 0) {
                                     Text(
                                         "هيقفل بعد ${formatTime(remaining)}",
@@ -243,6 +269,7 @@ class MainActivity : ComponentActivity() {
                         if (selecting) {
                             TextButton(onClick = {
                                 selected.clear()
+                                selected.addAll(folders.map { it.key })
                                 selected.addAll(items.map { it.key })
                             }) { Text("الكل") }
                             IconButton(onClick = { confirmDelete = true }) {
@@ -260,16 +287,16 @@ class MainActivity : ComponentActivity() {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
-                    top = padding.calculateTopPadding() + 8.dp,
+                    top = padding.calculateTopPadding() + 4.dp,
                     bottom = padding.calculateBottomPadding() + 8.dp,
-                    start = 12.dp, end = 12.dp
+                    start = 8.dp, end = 8.dp
                 ),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
                 if (dl.active) {
                     item(key = "__download") { DownloadCard(dl) }
                 }
-                if (items.isEmpty()) {
+                if (items.isEmpty() && folders.isEmpty()) {
                     item(key = "__empty") {
                         Text(
                             "مفيش فيديوهات لسه. اعمل Share لأي فيديو من يوتيوب واختار SleepTube.",
@@ -278,21 +305,31 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+                items(folders, key = { it.key }) { f ->
+                    val isSel = f.key in selected
+                    FolderRow(
+                        f, tick, isSel,
+                        modifier = Modifier.combinedClickable(
+                            onClick = {
+                                if (selecting) toggle(f.key) else {
+                                    openName = f.name
+                                    openDir = f.docId
+                                }
+                            },
+                            onLongClick = { if (!isSel) selected.add(f.key) }
+                        )
+                    )
+                }
                 items(items, key = { it.key }) { v ->
                     val isSel = v.key in selected
                     VideoRow(
                         v, tick, isSel,
                         modifier = Modifier.combinedClickable(
                             onClick = {
-                                if (selecting) {
-                                    if (isSel) selected.remove(v.key) else selected.add(v.key)
-                                } else {
-                                    PlayerActivity.start(ctx, items.toList(), items.indexOf(v))
-                                }
+                                if (selecting) toggle(v.key)
+                                else PlayerActivity.start(ctx, items.toList(), items.indexOf(v))
                             },
-                            onLongClick = {
-                                if (!isSel) selected.add(v.key)
-                            }
+                            onLongClick = { if (!isSel) selected.add(v.key) }
                         )
                     )
                 }
@@ -300,17 +337,27 @@ class MainActivity : ComponentActivity() {
         }
 
         if (confirmDelete) {
+            val delFolders = folders.filter { it.key in selected }
+            val delVideos = items.filter { it.key in selected }
+            val total = delVideos.size + delFolders.sumOf { it.count }
             AlertDialog(
                 onDismissRequest = { confirmDelete = false },
                 title = { Text("مسح") },
-                text = { Text("تمسح ${selected.size} ملف من الفولدر نهائيًا؟") },
+                text = {
+                    Text(
+                        if (delFolders.isEmpty()) "تمسح $total فيديو من الفولدر نهائيًا؟"
+                        else "تمسح $total فيديو (منهم ${delFolders.size} فولدر بلاي ليست) نهائيًا؟"
+                    )
+                },
                 confirmButton = {
                     TextButton(onClick = {
                         confirmDelete = false
-                        val toDelete = items.filter { it.key in selected }
                         selected.clear()
                         scope.launch {
-                            withContext(Dispatchers.IO) { toDelete.forEach { VideoRepo.delete(ctx, it) } }
+                            withContext(Dispatchers.IO) {
+                                delFolders.forEach { VideoRepo.deleteFolder(ctx, it) }
+                                delVideos.forEach { VideoRepo.delete(ctx, it) }
+                            }
                             refreshTick.intValue++
                         }
                     }) { Text("امسح") }
@@ -327,7 +374,7 @@ class MainActivity : ComponentActivity() {
         val ctx = LocalContext.current
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
         ) {
             Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -359,64 +406,100 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun watchedFraction(key: String): Float = when {
+        Prefs.finished(key) -> 1f
+        else -> {
+            val dur = Prefs.duration(key)
+            if (dur > 0) (Prefs.position(key).toFloat() / dur).coerceIn(0f, 1f) else 0f
+        }
+    }
+
+    /** No background of its own; only a subtle highlight while selected. */
+    @Composable
+    private fun rowModifier(isSel: Boolean, modifier: Modifier): Modifier {
+        val bg = if (isSel) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
+        return Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).then(modifier)
+    }
+
+    @Composable
+    private fun Thumb(item: VideoItem?, isSel: Boolean, badge: (@Composable () -> Unit)? = null) {
+        val ctx = LocalContext.current
+        val thumb by produceState(item?.let { VideoRepo.cachedThumb(it) }, item?.key) {
+            if (value == null && item != null) value = withContext(Dispatchers.IO) { VideoRepo.thumbnail(ctx, item) }
+        }
+        Box(
+            Modifier.width(128.dp).height(72.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF263040)),
+            contentAlignment = Alignment.Center
+        ) {
+            val b = thumb
+            if (b != null) {
+                Image(
+                    b.asImageBitmap(), contentDescription = null,
+                    contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Icon(
+                    Icons.Filled.PlayArrow, contentDescription = null,
+                    tint = Color(0xFFB0BEC5), modifier = Modifier.size(36.dp)
+                )
+            }
+            badge?.invoke()
+            if (isSel) {
+                Icon(
+                    Icons.Filled.CheckCircle, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.align(Alignment.TopStart).padding(4.dp)
+                )
+            }
+        }
+    }
+
     @Composable
     private fun VideoRow(v: VideoItem, tick: Int, isSel: Boolean, modifier: Modifier) {
-        val ctx = LocalContext.current
-        val pos = remember(v.key, tick) { Prefs.position(v.key) }
-        val dur = remember(v.key, tick) { Prefs.duration(v.key) }
-        val fin = remember(v.key, tick) { Prefs.finished(v.key) }
-        val thumb by produceState(VideoRepo.cachedThumb(v), v.key) {
-            if (value == null) value = withContext(Dispatchers.IO) { VideoRepo.thumbnail(ctx, v) }
+        val frac = remember(v.key, tick) { watchedFraction(v.key) }
+        Row(rowModifier(isSel, modifier).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Thumb(v, isSel)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    v.title, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth().height(3.dp))
+            }
         }
-        val bg = if (isSel) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
-        Card(
-            colors = CardDefaults.cardColors(containerColor = bg),
-            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).then(modifier)
-        ) {
-            Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier.width(128.dp).height(72.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF263040)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    val b = thumb
-                    if (b != null) {
-                        Image(
-                            b.asImageBitmap(), contentDescription = null,
-                            contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Icon(
-                            Icons.Filled.PlayArrow, contentDescription = null,
-                            tint = Color(0xFFB0BEC5), modifier = Modifier.size(36.dp)
-                        )
-                    }
-                    if (isSel) {
-                        Icon(
-                            Icons.Filled.CheckCircle, contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.align(Alignment.TopStart).padding(4.dp)
-                        )
+    }
+
+    @Composable
+    private fun FolderRow(f: FolderItem, tick: Int, isSel: Boolean, modifier: Modifier) {
+        val frac = remember(f.key, tick, f.count) {
+            if (f.count == 0) 0f else f.videos.sumOf { watchedFraction(it.key).toDouble() }.toFloat() / f.count
+        }
+        Row(rowModifier(isSel, modifier).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Thumb(f.videos.firstOrNull(), isSel) {
+                Box(Modifier.fillMaxSize().background(Color(0x66000000)), contentAlignment = Alignment.Center) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, tint = Color.White)
+                        Spacer(Modifier.width(4.dp))
+                        Text("${f.count}", color = Color.White, fontWeight = FontWeight.Bold)
                     }
                 }
-                Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(v.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge)
-                    Spacer(Modifier.height(6.dp))
-                    val frac = when {
-                        fin -> 1f
-                        dur > 0 -> (pos.toFloat() / dur).coerceIn(0f, 1f)
-                        else -> 0f
-                    }
-                    LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth().height(3.dp))
-                    Spacer(Modifier.height(4.dp))
-                    val status = when {
-                        fin -> "خلص"
-                        pos > 0 && dur > 0 -> "وقفت عند ${formatTime(pos)} من ${formatTime(dur)}"
-                        pos > 0 -> "وقفت عند ${formatTime(pos)}"
-                        else -> "لسه متشافش"
-                    }
-                    Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    f.name, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                Text(
+                    "${f.count} فيديو", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(6.dp))
+                LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth().height(3.dp))
             }
         }
     }
