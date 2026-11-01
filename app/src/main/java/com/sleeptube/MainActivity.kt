@@ -729,7 +729,7 @@ class MainActivity : ComponentActivity() {
 
                 Text("تحديث التطبيق", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(8.dp))
-                val um by updateMsg
+                val um by this@MainActivity.updateMsg
                 val av by update
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedButton(onClick = { checkForUpdateNow() }) { Text("تحقق من تحديث") }
