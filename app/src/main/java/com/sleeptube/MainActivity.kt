@@ -1,6 +1,7 @@
 package com.sleeptube
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -52,6 +54,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -95,6 +99,15 @@ class MainActivity : ComponentActivity() {
 
     private val refreshTick = mutableIntStateOf(0)
     private val folderOk = mutableStateOf(false)
+    private val tab = mutableIntStateOf(0) // 0 = التحميلات, 1 = المتابعة
+    private val showSettings = mutableStateOf(false)
+    private val pendingSubUrl = mutableStateOf<String?>(null)
+
+    // in-app updater state
+    private val update = mutableStateOf<Updater.Result.Available?>(null)
+    private val updateProgress = mutableStateOf<Float?>(null) // null = not downloading
+    private val updateMsg = mutableStateOf<String?>(null)
+    private var installAfterPermission = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -105,6 +118,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch { SleepTimer.expired.collect { finishAndRemoveTask() } }
         lifecycleScope.launch { SleepTimer.closed.collect { finishAndRemoveTask() } }
         lifecycleScope.launch { DownloadService.changed.collect { refreshTick.intValue++ } }
+        handleIntent(intent)
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -115,13 +129,118 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(i: Intent?) {
+        val u = i?.getStringExtra(EXTRA_ADD_SUB) ?: return
+        i.removeExtra(EXTRA_ADD_SUB)
+        pendingSubUrl.value = u
+        showSettings.value = false
+        tab.intValue = 1
+    }
+
     override fun onResume() {
         super.onResume()
         folderOk.value = VideoRepo.hasFolderAccess(this)
         refreshTick.intValue++
         if (folderOk.value) {
             consumePendingUrl()
+            if (Subs.enqueueDueChecks()) DownloadService.start(this)
             DownloadService.resumeIfNeeded(this)
+        }
+        if (installAfterPermission && Updater.canInstall(this)) {
+            installAfterPermission = false
+            startUpdate()
+        }
+        lifecycleScope.launch {
+            val r = withContext(Dispatchers.IO) { Updater.checkIfDue() }
+            if (r is Updater.Result.Available) update.value = r
+        }
+    }
+
+    /** Settings button: explicit check with feedback. */
+    private fun checkForUpdateNow() {
+        updateMsg.value = "بيدور على تحديث…"
+        lifecycleScope.launch {
+            Prefs.lastAppUpdateCheck = System.currentTimeMillis()
+            when (val r = withContext(Dispatchers.IO) { Updater.check() }) {
+                is Updater.Result.Available -> { update.value = r; updateMsg.value = "فيه تحديث جديد (نسخة ${r.versionCode})" }
+                Updater.Result.UpToDate -> updateMsg.value = "عندك آخر نسخة"
+                Updater.Result.Unreachable -> updateMsg.value = "مش قادر أوصل للتحديثات"
+            }
+        }
+    }
+
+    private fun startUpdate() {
+        val u = update.value ?: return
+        if (updateProgress.value != null) return
+        if (!Updater.canInstall(this)) {
+            installAfterPermission = true
+            Toast.makeText(this, "اسمح لـ SleepTube بتثبيت التحديثات وارجع", Toast.LENGTH_LONG).show()
+            Updater.openInstallPermissionSettings(this)
+            return
+        }
+        updateProgress.value = 0f
+        lifecycleScope.launch {
+            val apk = withContext(Dispatchers.IO) {
+                try {
+                    Updater.download(this@MainActivity, u.apkUrl) { p -> updateProgress.value = p }
+                } catch (e: Exception) { null }
+            }
+            updateProgress.value = null
+            if (apk == null) {
+                Toast.makeText(this@MainActivity, "مش قادر أوصل للتحديثات", Toast.LENGTH_LONG).show()
+            } else {
+                try { Updater.install(this@MainActivity, apk) } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "مقدرتش أفتح التثبيت", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun BottomNav() {
+        val t by tab
+        NavigationBar {
+            NavigationBarItem(
+                selected = t == 0, onClick = { tab.intValue = 0 },
+                icon = { Icon(Icons.Filled.PlayArrow, contentDescription = null) },
+                label = { Text("التحميلات") }
+            )
+            NavigationBarItem(
+                selected = t == 1, onClick = { tab.intValue = 1 },
+                icon = { Icon(Icons.Filled.Notifications, contentDescription = null) },
+                label = { Text("المتابعة") }
+            )
+        }
+    }
+
+    @Composable
+    private fun UpdateBanner() {
+        val u by update
+        val prog by updateProgress
+        val info = u ?: return
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("فيه تحديث جديد (نسخة ${info.versionCode})", modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                    if (prog == null) {
+                        TextButton(onClick = { update.value = null }) { Text("بعدين") }
+                        Button(onClick = { startUpdate() }) { Text("تحديث") }
+                    }
+                }
+                prog?.let {
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth())
+                }
+            }
         }
     }
 
@@ -163,16 +282,28 @@ class MainActivity : ComponentActivity() {
             ) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        var showSettings by remember { mutableStateOf(false) }
+        val settings by showSettings
         val ok by folderOk
+        val t by tab
+        val remaining by SleepTimer.remaining.collectAsState()
+        val prefill by pendingSubUrl
 
         when {
             !ok -> Onboarding { pickFolder.launch(Prefs.folderUri) }
-            showSettings -> {
-                BackHandler { showSettings = false }
-                SettingsScreen(onBack = { showSettings = false }, onChangeFolder = { pickFolder.launch(Prefs.folderUri) })
+            settings -> {
+                BackHandler { showSettings.value = false }
+                SettingsScreen(onBack = { showSettings.value = false }, onChangeFolder = { pickFolder.launch(Prefs.folderUri) })
             }
-            else -> ListScreen(onSettings = { showSettings = true })
+            t == 1 -> {
+                BackHandler { tab.intValue = 0 }
+                SubsScreen(
+                    bottomBar = { BottomNav() },
+                    timerText = if (remaining >= 0) "هيقفل بعد ${formatTime(remaining)}" else null,
+                    prefillUrl = prefill,
+                    onPrefillConsumed = { pendingSubUrl.value = null },
+                )
+            }
+            else -> ListScreen(onSettings = { showSettings.value = true })
         }
     }
 
@@ -232,6 +363,7 @@ class MainActivity : ComponentActivity() {
         BackHandler(enabled = !selecting && openDir != null) { openDir = null }
 
         Scaffold(
+            bottomBar = { if (!selecting) BottomNav() },
             topBar = {
                 TopAppBar(
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -293,6 +425,7 @@ class MainActivity : ComponentActivity() {
                 ),
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
+                item(key = "__update") { UpdateBanner() }
                 if (dl.active) {
                     item(key = "__download") { DownloadCard(dl) }
                 }
@@ -590,6 +723,30 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(4.dp))
                     Text(it, style = MaterialTheme.typography.bodySmall)
                 }
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(16.dp))
+
+                Text("تحديث التطبيق", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+                val um by updateMsg
+                val av by update
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = { checkForUpdateNow() }) { Text("تحقق من تحديث") }
+                    if (av != null) {
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = { startUpdate() }) { Text("تحديث") }
+                    }
+                }
+                um?.let {
+                    Spacer(Modifier.height(4.dp))
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
+                updateProgress.value?.let {
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth())
+                }
+
                 Spacer(Modifier.height(24.dp))
                 Text(
                     "نسخة التطبيق: " + (try {
@@ -600,5 +757,9 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    companion object {
+        const val EXTRA_ADD_SUB = "add_sub_url"
     }
 }

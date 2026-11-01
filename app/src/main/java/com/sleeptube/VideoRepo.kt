@@ -43,7 +43,7 @@ object VideoRepo {
     val VIDEO_EXT = setOf("mp4", "webm", "mkv", "3gp", "mov", "m4v", "avi", "ts")
     val AUDIO_EXT = setOf("m4a", "mp3", "opus", "ogg", "aac", "wav", "flac", "weba")
     private val ID_SUFFIX = Regex("""\s*\[([A-Za-z0-9_-]{11})]$""")
-    private val INDEX_PREFIX = Regex("""^\d{1,4} - """)
+    private val INDEX_PREFIX = Regex("""^(\d{4}-\d{2}-\d{2}|\d{1,4}) - """)
     private val BAD_CHARS = Regex("""[\\/:*?"<>|\p{Cntrl}]""")
     private val SPACES = Regex("""\s+""")
 

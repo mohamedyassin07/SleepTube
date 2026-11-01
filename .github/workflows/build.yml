@@ -47,6 +47,9 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
           echo "APK: $APK"
           cp "$APK" SleepTube.apk
+          printf '{"versionCode": %s, "versionName": "1.0.%s", "sha": "%s"}\n' \
+            "${{ github.run_number }}" "${{ github.run_number }}" "${{ github.sha }}" > version.json
+          cat version.json
           ls -l SleepTube.apk
           if [ -n "$KEYSTORE_FILE" ]; then
             "$ANDROID_HOME"/build-tools/$(ls "$ANDROID_HOME"/build-tools | sort -V | tail -n1)/apksigner verify --print-certs SleepTube.apk | head -n 5 || true
@@ -55,14 +58,17 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: SleepTube-apk
-          path: SleepTube.apk
+          path: |
+            SleepTube.apk
+            version.json
 
       - name: Publish rolling release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest -y --cleanup-tag || true
-          gh release create latest SleepTube.apk \
+          gh release create latest SleepTube.apk version.json \
             --title "SleepTube (build ${{ github.run_number }})" \
-            --notes "Automatic build from ${{ github.sha }}" \
+            --notes "versionCode: ${{ github.run_number }}
+          Automatic build from ${{ github.sha }}" \
             --target "${{ github.sha }}"

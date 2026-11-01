@@ -91,7 +91,10 @@ object Prefs {
                 is JSONObject -> {
                     val u = o.optString("u")
                     if (u.isNotEmpty()) out.add(
-                        QueueItem(u, o.optString("d").ifEmpty { null }, o.optInt("i", 0), o.optInt("n", 0))
+                        QueueItem(
+                            u, o.optString("d").ifEmpty { null }, o.optInt("i", 0), o.optInt("n", 0),
+                            o.optString("p").ifEmpty { null }, o.optString("s").ifEmpty { null },
+                        )
                     )
                 }
                 is String -> if (o.isNotEmpty()) out.add(QueueItem(o))
@@ -108,6 +111,8 @@ object Prefs {
             if (it.dir != null) o.put("d", it.dir)
             if (it.index > 0) o.put("i", it.index)
             if (it.total > 0) o.put("n", it.total)
+            if (it.prefix != null) o.put("p", it.prefix)
+            if (it.sub != null) o.put("s", it.sub)
             arr.put(o)
         }
         return sp.edit().putString(K_QUEUE, arr.toString()).commit()
@@ -155,6 +160,11 @@ object Prefs {
     }
 
     @Synchronized fun clearQueue() { writeQueue(emptyList()) }
+
+    // ---- in-app updater ----
+    var lastAppUpdateCheck: Long
+        get() = sp.getLong("last_app_update_check", 0L)
+        set(v) { sp.edit().putLong("last_app_update_check", v).apply() }
 }
 
 /** One download job. [dir] = document id of the target subfolder (null = chosen folder root). */
@@ -163,4 +173,10 @@ data class QueueItem(
     val dir: String? = null,
     val index: Int = 0,
     val total: Int = 0,
-)
+    /** File name prefix, e.g. upload date "2026-11-01" for subscription downloads. */
+    val prefix: String? = null,
+    /** Subscription (channel id) this download came from. */
+    val sub: String? = null,
+) {
+    val isSubCheck: Boolean get() = url.startsWith(Subs.CHECK_PREFIX)
+}

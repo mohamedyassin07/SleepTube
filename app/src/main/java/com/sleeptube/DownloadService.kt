@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
@@ -187,6 +188,10 @@ class DownloadService : Service() {
                 notifyResult("فشل التحميل", e.message?.take(200) ?: item.url)
                 false
             }
+            if (!ok && item.sub != null) {
+                // Let the next subscription check try this video again.
+                videoIdOf(item.url)?.let { Subs.unsee(item.sub, it) }
+            }
             if (!Prefs.removeHead(item)) {
                 notifyResult("فشل التحميل", "مقدرتش أحدث طابور التحميل")
                 return true
@@ -204,6 +209,7 @@ class DownloadService : Service() {
     /** Returns false on failure; true on success, skip (already exists) or cancel. */
     private fun processItem(item: QueueItem): Boolean {
         val url = item.url
+        if (item.isSubCheck) return checkSubscription(item)
         if (item.index == 0 && isPlaylistUrl(url)) return expandPlaylist(item)
         val vid = videoIdOf(url)
         if (vid != null && VideoRepo.existsId(this, vid, item.dir)) return true
@@ -247,12 +253,15 @@ class DownloadService : Service() {
             val id = VideoRepo.idOf(file.name)
             if (id != null && VideoRepo.existsId(this, id, item.dir)) return true
             val title = VideoRepo.titleOf(file.name)
-            val displayName = if (item.dir != null && item.index > 0) {
+            val displayName = if (item.prefix != null) {
+                item.prefix + " - " + file.name
+            } else if (item.dir != null && item.index > 0) {
                 val width = maxOf(3, item.total.toString().length)
                 item.index.toString().padStart(width, '0') + " - " + file.name
             } else file.name
             updateState(_state.value.copy(title = title, progress = 100f), force = true)
             VideoRepo.saveToFolder(this, file, item.dir, displayName)
+            item.sub?.let { Subs.incDownloaded(it) }
             _changed.tryEmit(Unit)
             notifyResult("خلص التحميل", title)
             return true
@@ -293,6 +302,111 @@ class DownloadService : Service() {
         } finally {
             currentProcessId = null
         }
+    }
+
+    /** Runs yt-dlp and parses its JSON output. Throws on failure / CanceledException on cancel. */
+    private fun execJson(req: YoutubeDLRequest, tag: String): JSONObject {
+        val pid = tag + "-" + counter.incrementAndGet()
+        currentProcessId = pid
+        try {
+            if (cancelCurrent) throw IllegalStateException("canceled")
+            val out = YoutubeDL.getInstance().execute(req, pid).out
+            return JSONObject(out.substring(out.indexOf('{')))
+        } finally {
+            currentProcessId = null
+        }
+    }
+
+    private fun isLiveish(liveStatus: String) =
+        liveStatus == "is_live" || liveStatus == "is_upcoming" || liveStatus == "post_live"
+
+    /**
+     * Looks for new uploads of a followed channel and queues them in place of the check item.
+     * Scans the channel's Videos tab (newest first, no Shorts/streams tabs), at most
+     * [SUB_SCAN_LIMIT] entries and [SUB_META_LIMIT] per-video metadata lookups, and stops at the
+     * first video older than the subscription's start date.
+     */
+    private fun checkSubscription(item: QueueItem): Boolean {
+        val subId = item.url.removePrefix(Subs.CHECK_PREFIX)
+        val sub = Subs.get(subId) ?: return true // deleted meanwhile
+        updateState(DlState(true, "بيدور على جديد: ${sub.name}", -1f, -1, Prefs.queueSize()), force = true)
+        val flat = try {
+            val req = YoutubeDLRequest(sub.url)
+            req.addOption("--flat-playlist")
+            req.addOption("--playlist-end", SUB_SCAN_LIMIT.toString())
+            req.addOption("-J")
+            execJson(req, "subflat")
+        } catch (e: Throwable) {
+            if (cancelCurrent) return true
+            Subs.markChecked(subId, false)
+            notifyResult("فشل التحقق من ${sub.name}", shortError(e) ?: "")
+            return false
+        }
+        val entries = flat.optJSONArray("entries") ?: JSONArray()
+        val seen = Subs.seen(subId)
+        val rejected = Subs.rejected(subId)
+        val newRejected = ArrayList<String>()
+        class Cand(val id: String, val date: String, val pos: Int)
+        val accepted = ArrayList<Cand>()
+        var metaCalls = 0
+        for (pos in 0 until minOf(entries.length(), SUB_SCAN_LIMIT)) {
+            if (cancelCurrent || stopRequested) return true
+            val e = entries.optJSONObject(pos) ?: continue
+            val id = e.optString("id")
+            if (id.length != 11 || id in seen || id in rejected) continue
+            val flatTitle = e.optString("title")
+            if (sub.keyword.isNotBlank() && flatTitle.isNotEmpty() &&
+                !flatTitle.contains(sub.keyword.trim(), ignoreCase = true)
+            ) continue
+            val flatDur = e.optDouble("duration", -1.0)
+            if (flatDur in 0.0..SHORTS_MAX_SEC) { newRejected.add(id); continue }
+            if (isLiveish(e.optString("live_status"))) continue // live / upcoming: look again next time
+            if (metaCalls >= SUB_META_LIMIT) break
+            metaCalls++
+            val m = try {
+                val req = YoutubeDLRequest("https://www.youtube.com/watch?v=$id")
+                req.addOption("-J")
+                req.addOption("--skip-download")
+                req.addOption("--no-playlist")
+                execJson(req, "submeta")
+            } catch (t: Throwable) {
+                if (cancelCurrent) return true
+                continue // e.g. members-only or temporarily unavailable; try again next check
+            }
+            val date = m.optString("upload_date")
+            if (date.length != 8) continue
+            // Newest first: everything from here on is older than the start date.
+            if (date < sub.startDate) break
+            if (isLiveish(m.optString("live_status"))) continue
+            val dur = m.optDouble("duration", -1.0)
+            if (dur in 0.0..SHORTS_MAX_SEC) { newRejected.add(id); continue }
+            val title = m.optString("title").ifEmpty { flatTitle }
+            if (sub.keyword.isNotBlank() && !title.contains(sub.keyword.trim(), ignoreCase = true)) continue
+            accepted.add(Cand(id, date, pos))
+        }
+        Subs.addRejected(subId, newRejected)
+        // Oldest first so the queue (and the date-prefixed names) follow upload order.
+        val ordered = accepted.sortedWith(compareBy<Cand>({ it.date }, { -it.pos }))
+        val jobs = if (ordered.isEmpty()) emptyList() else {
+            val dir = VideoRepo.findOrCreateSubfolder(this, VideoRepo.sanitizeName(sub.name))
+            ordered.map {
+                QueueItem(
+                    "https://www.youtube.com/watch?v=${it.id}", dir,
+                    prefix = Subs.prettyYmd(it.date), sub = subId
+                )
+            }
+        }
+        if (!Prefs.replace(item, jobs)) {
+            Subs.markChecked(subId, false)
+            return false
+        }
+        Subs.addSeen(subId, ordered.map { it.id })
+        Subs.markChecked(subId, true)
+        if (ordered.isNotEmpty()) {
+            _changed.tryEmit(Unit)
+            notifyResult("فيديوهات جديدة من ${sub.name}", "${ordered.size} فيديو اتضافوا للتحميل")
+        }
+        return true
     }
 
     /** Expands a playlist into its own subfolder, keeping playlist order. */
@@ -437,6 +551,9 @@ class DownloadService : Service() {
         private const val NOTIF_PROGRESS = 1001
         private const val LOCK_TIMEOUT_MS = 60 * 60 * 1000L
         private const val MAX_CONSECUTIVE_FAILURES = 3
+        private const val SUB_SCAN_LIMIT = 100
+        private const val SUB_META_LIMIT = 30
+        private const val SHORTS_MAX_SEC = 60.0
         private val counter = AtomicInteger(0)
         private val resultIds = AtomicInteger(2000)
 

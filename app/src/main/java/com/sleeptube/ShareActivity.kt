@@ -35,6 +35,15 @@ class ShareActivity : Activity() {
             Toast.makeText(this, "مفيش لينك", Toast.LENGTH_SHORT).show()
             return
         }
+        if (Subs.isChannelUrl(url)) {
+            // A channel: offer to follow it instead of downloading.
+            startActivity(
+                Intent(this, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra(MainActivity.EXTRA_ADD_SUB, url)
+            )
+            return
+        }
         if (!VideoRepo.hasFolderAccess(this)) {
             // Keep it in the persisted queue; MainActivity starts the download after a folder is picked.
             Prefs.enqueue(QueueItem(url))
