@@ -36,7 +36,8 @@ class ShareActivity : Activity() {
             return
         }
         if (!VideoRepo.hasFolderAccess(this)) {
-            Prefs.pendingUrl = url
+            // Keep it in the persisted queue; MainActivity starts the download after a folder is picked.
+            Prefs.enqueue(url)
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
