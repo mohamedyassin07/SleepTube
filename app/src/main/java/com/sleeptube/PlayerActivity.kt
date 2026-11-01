@@ -205,6 +205,8 @@ class PlayerActivity : ComponentActivity() {
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         playerView.useController = !isInPictureInPictureMode
+        SleepTimer.playerInPip = isInPictureInPictureMode
+        if (!isInPictureInPictureMode) SleepTimer.playerLeftPipAt = android.os.SystemClock.elapsedRealtime()
         if (isInPictureInPictureMode) {
             playerView.hideController()
         } else if (lifecycle.currentState == Lifecycle.State.CREATED) {
@@ -227,6 +229,7 @@ class PlayerActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         leftPipAt = 0L
+        SleepTimer.playerLeftPipAt = 0L
     }
 
     private fun onPipDismissed() {
@@ -258,6 +261,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        SleepTimer.playerInPip = false
         controller?.removeListener(playerListener)
         playerView.player = null
         controllerFuture?.let { MediaController.releaseFuture(it) }

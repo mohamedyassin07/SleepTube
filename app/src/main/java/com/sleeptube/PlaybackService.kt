@@ -99,9 +99,11 @@ class PlaybackService : MediaSessionService() {
             if (reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION) {
                 // Played to the end -> finished; next time it starts from 0.
                 Prefs.markFinished(oldId, 0L)
-            } else {
+            } else if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                // next / previous: remember where we left the old item.
                 Prefs.savePosition(oldId, oldPosition.positionMs, 0L)
             }
+            // REMOVE (playlist replaced): PlayerActivity already saved the old item.
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -156,9 +158,14 @@ class PlaybackService : MediaSessionService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if (!SleepTimer.isFullClose(rootIntent)) return
-        shutdown()
-        SleepTimer.reset()
+        when (SleepTimer.classify(rootIntent)) {
+            SleepTimer.TaskRemoval.PIP_DISMISSED -> player.pause() // listener saves the position
+            SleepTimer.TaskRemoval.IGNORE -> {}
+            SleepTimer.TaskRemoval.FULL_CLOSE -> {
+                shutdown()
+                SleepTimer.reset()
+            }
+        }
     }
 
     override fun onDestroy() {

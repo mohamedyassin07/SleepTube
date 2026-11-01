@@ -71,17 +71,29 @@ object SleepTimer {
         playerSelfFinishAt = SystemClock.elapsedRealtime()
     }
 
+    /** PlayerActivity PiP bookkeeping (dismissing PiP also removes the player's task). */
+    @Volatile var playerInPip: Boolean = false
+    @Volatile var playerLeftPipAt: Long = 0L
+
+    enum class TaskRemoval { FULL_CLOSE, PIP_DISMISSED, IGNORE }
+
     /**
      * Services get onTaskRemoved not only when the user swipes a task away, but also when a task
      * disappears because its activity finished itself (PlayerActivity has autoRemoveFromRecents,
-     * ShareActivity is excluded from recents). Only a user swipe counts as a "full close".
+     * ShareActivity is excluded from recents) or when the PiP window is dismissed.
+     * Only a user swipe from recents counts as a "full close".
      */
-    fun isFullClose(rootIntent: android.content.Intent?): Boolean {
-        val cls = rootIntent?.component?.className ?: return true
-        if (cls == ShareActivity::class.java.name) return false
-        if (cls == PlayerActivity::class.java.name &&
-            SystemClock.elapsedRealtime() - playerSelfFinishAt < 5000
-        ) return false
-        return true
+    fun classify(rootIntent: android.content.Intent?): TaskRemoval {
+        val cls = rootIntent?.component?.className ?: return TaskRemoval.FULL_CLOSE
+        if (cls == ShareActivity::class.java.name) return TaskRemoval.IGNORE
+        if (cls == PlayerActivity::class.java.name) {
+            val now = SystemClock.elapsedRealtime()
+            if (playerInPip || now - playerLeftPipAt < 3000) return TaskRemoval.PIP_DISMISSED
+            if (now - playerSelfFinishAt < 5000) return TaskRemoval.IGNORE
+        }
+        return TaskRemoval.FULL_CLOSE
     }
+
+    fun isFullClose(rootIntent: android.content.Intent?): Boolean =
+        classify(rootIntent) == TaskRemoval.FULL_CLOSE
 }

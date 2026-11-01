@@ -65,7 +65,11 @@ class DownloadService : Service() {
         // Must always call startForeground promptly after startForegroundService().
         goForeground(buildProgressNotification(_state.value.title ?: "بيجهز التحميل…", -1f, -1, Prefs.queueSize()))
         when (intent?.action) {
-            ACTION_CANCEL -> cancelRunning()
+            ACTION_CANCEL -> {
+                cancelRunning()
+                // A stale cancel (e.g. old notification after process death) must not start work.
+                if (!loopRunning) { finish(); return START_NOT_STICKY }
+            }
             ACTION_CANCEL_ALL -> {
                 Prefs.clearQueue()
                 cancelRunning()

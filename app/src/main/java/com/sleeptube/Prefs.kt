@@ -52,6 +52,12 @@ object Prefs {
     fun startPosition(uri: String): Long = if (finished(uri)) 0L else position(uri)
 
     fun savePosition(uri: String, positionMs: Long, durationMs: Long) {
+        val knownDur = if (durationMs > 0) durationMs else duration(uri)
+        if (knownDur > 0 && positionMs >= knownDur - 1500) {
+            // Stopped at the very end: treat as finished so it doesn't resume at the end.
+            markFinished(uri, knownDur)
+            return
+        }
         val e = sp.edit()
         e.putLong(posKey(uri), positionMs.coerceAtLeast(0L))
         if (durationMs > 0) e.putLong(durKey(uri), durationMs)
