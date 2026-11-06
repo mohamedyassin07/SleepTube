@@ -100,7 +100,8 @@ class DownloadService : Service() {
     /** Main thread. Starts the worker loop unless it is already running. */
     private fun ensureLoop() {
         if (loopRunning || stopRequested) return
-        if (Prefs.queueHead() == null) {
+        if (Net.nextEligible(this) == null) {
+            // Empty, or only items waiting for (Wi-Fi) internet: they stay queued for later.
             finish()
             return
         }
@@ -118,7 +119,7 @@ class DownloadService : Service() {
             // After a halt (init failure, repeated failures, queue write failure) only a new
             // enqueue may restart the loop; otherwise it could spin forever holding locks.
             if (!stopRequested && (!halted || newRequest) &&
-                Prefs.queueHead() != null && VideoRepo.hasFolderAccess(this@DownloadService)
+                Net.nextEligible(this@DownloadService) != null && VideoRepo.hasFolderAccess(this@DownloadService)
             ) {
                 ensureLoop()
             } else {
@@ -175,7 +176,9 @@ class DownloadService : Service() {
         Ytdl.updateIfStale(this, 24 * 3600_000L)
         var failures = 0
         while (!stopRequested) {
-            val item = Prefs.queueHead() ?: return false
+            // First item allowed on this connection; subscription items wait for Wi-Fi if
+            // required, everything waits (stays queued) when there is no internet.
+            val item = Net.nextEligible(this) ?: return false
             if (!VideoRepo.hasFolderAccess(this)) {
                 notifyResult("اختار فولدر التحميل", "افتح التطبيق واختار الفولدر")
                 return true
@@ -187,6 +190,11 @@ class DownloadService : Service() {
             } catch (e: Throwable) {
                 notifyResult("فشل التحميل", e.message?.take(200) ?: item.url)
                 false
+            }
+            if (!ok && !cancelCurrent && !Net.eligible(this, item)) {
+                // Lost the (Wi-Fi) connection mid-way: keep the item queued, don't count a failure.
+                // The loop moves on to items still allowed, or ends and resumes on reconnect.
+                continue
             }
             if (!ok && item.sub != null) {
                 // Let the next subscription check try this video again.
@@ -576,7 +584,7 @@ class DownloadService : Service() {
 
         /** Call from a visible activity: restarts a queue left over from a killed process. */
         fun resumeIfNeeded(ctx: Context) {
-            if (!_state.value.active && Prefs.queueHead() != null && VideoRepo.hasFolderAccess(ctx)) {
+            if (!_state.value.active && VideoRepo.hasFolderAccess(ctx) && Net.nextEligible(ctx) != null) {
                 start(ctx)
             }
         }

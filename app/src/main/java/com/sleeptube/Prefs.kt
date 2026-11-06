@@ -50,7 +50,14 @@ object Prefs {
     fun finished(uri: String): Boolean = sp.getBoolean(finKey(uri), false)
 
     /** Position to start from: 0 for finished items. */
-    fun startPosition(uri: String): Long = if (finished(uri)) 0L else position(uri)
+    fun startPosition(uri: String): Long {
+        if (finished(uri)) return 0L
+        val pos = position(uri)
+        val dur = duration(uri)
+        // Never resume at (or past) the very end: that would end immediately and skip on.
+        if (dur > 0 && pos >= dur - 3000) return 0L
+        return pos
+    }
 
     fun savePosition(uri: String, positionMs: Long, durationMs: Long) {
         val knownDur = if (durationMs > 0) durationMs else duration(uri)
@@ -160,6 +167,11 @@ object Prefs {
     }
 
     @Synchronized fun clearQueue() { writeQueue(emptyList()) }
+
+    /** Subscription checks and their downloads only on Wi-Fi / unmetered networks. */
+    var subsWifiOnly: Boolean
+        get() = sp.getBoolean("subs_wifi_only", true)
+        set(v) { sp.edit().putBoolean("subs_wifi_only", v).apply() }
 
     // ---- in-app updater ----
     var lastAppUpdateCheck: Long

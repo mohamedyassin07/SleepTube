@@ -1,6 +1,7 @@
 package com.sleeptube
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -69,6 +71,16 @@ private fun utcMillisToYmd(ms: Long): String =
 /** Starts the download service if a check/download was queued and the folder is usable. */
 private fun kick(ctx: Context, queued: Boolean) {
     if (queued && VideoRepo.hasFolderAccess(ctx)) DownloadService.start(ctx)
+}
+
+/** Manual check: only with (Wi-Fi) internet, otherwise tell the user why. */
+private fun manualCheck(ctx: Context, enqueue: () -> Boolean) {
+    val reason = Net.subsBlockedReason(ctx)
+    if (reason != null) {
+        Toast.makeText(ctx, reason, Toast.LENGTH_SHORT).show()
+        return
+    }
+    kick(ctx, enqueue())
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -109,7 +121,7 @@ fun SubsScreen(
                     }
                 },
                 actions = {
-                    if (subs.isNotEmpty()) TextButton(onClick = { kick(ctx, Subs.enqueueAllChecks()) }) {
+                    if (subs.isNotEmpty()) TextButton(onClick = { manualCheck(ctx) { Subs.enqueueAllChecks() } }) {
                         Text("تحقق الكل")
                     }
                 }
@@ -131,6 +143,28 @@ fun SubsScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            item(key = "__wifi") {
+                var wifiOnly by remember { mutableStateOf(Prefs.subsWifiOnly) }
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("تحميل المتابعة على Wi-Fi بس", color = MaterialTheme.colorScheme.onBackground)
+                        Text(
+                            "اللينكات اللي بتعملها Share بتتحمل على أي نت.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = wifiOnly, onCheckedChange = {
+                        wifiOnly = it
+                        Prefs.subsWifiOnly = it
+                        if (!it) DownloadService.resumeIfNeeded(ctx)
+                    })
+                }
+                HorizontalDivider()
+            }
             if (subs.isEmpty()) item {
                 Text(
                     "مش متابع أي قناة. دوس + وحط لينك القناة، أو اعمل Share للينك قناة من يوتيوب.",
@@ -147,7 +181,7 @@ fun SubsScreen(
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onBackground
                         )
-                        IconButton(onClick = { kick(ctx, Subs.enqueueCheck(s.id)) }) {
+                        IconButton(onClick = { manualCheck(ctx) { Subs.enqueueCheck(s.id) } }) {
                             Icon(Icons.Filled.Refresh, contentDescription = "تحقق الآن")
                         }
                         IconButton(onClick = { editing = s }) {
@@ -277,7 +311,8 @@ private fun SubDialog(
                         error = "مقدرتش أوصل للقناة. اتأكد من اللينك والنت."
                     } else {
                         Subs.upsert(Sub(r.id, r.name, Subs.canonicalUrl(r.id), start, keyword.trim()))
-                        kick(ctx, Subs.enqueueCheck(r.id))
+                        if (Net.subsAllowed(ctx)) kick(ctx, Subs.enqueueCheck(r.id))
+                        else Toast.makeText(ctx, "اتضافت. هتتحقق لما يبقى فيه Wi-Fi", Toast.LENGTH_SHORT).show()
                         onSaved()
                     }
                 }

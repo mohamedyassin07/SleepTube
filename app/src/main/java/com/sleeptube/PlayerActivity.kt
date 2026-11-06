@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Rational
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -17,6 +18,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -62,6 +64,13 @@ class PlayerActivity : ComponentActivity() {
             controllerAutoShow = true
         }
         setContentView(playerView)
+        // Keep the controller (seek bar + buttons) inside the safe area: it must never sit under
+        // the navigation bar / cutout, whether the bars are currently hidden or shown on swipe.
+        // The video itself stays edge to edge.
+        ViewCompat.setOnApplyWindowInsetsListener(playerView) { _, insets ->
+            applyControllerInsets(insets)
+            insets
+        }
         goImmersive()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -127,20 +136,10 @@ class PlayerActivity : ComponentActivity() {
         }
         val start = if (sameItem && usable) c.currentPosition else Prefs.startPosition(target)
 
-        val items = uris.mapIndexed { i, u ->
-            val uri = Uri.parse(u)
-            MediaItem.Builder()
-                .setMediaId(u)
-                .setUri(uri)
-                .setRequestMetadata(MediaItem.RequestMetadata.Builder().setMediaUri(uri).build())
-                .setMediaMetadata(
-                    MediaMetadata.Builder()
-                        .setTitle(titles.getOrNull(i) ?: "")
-                        .setDisplayTitle(titles.getOrNull(i) ?: "")
-                        .build()
-                )
-                .build()
-        }
+        val items = uris.mapIndexed { i, u -> PlaybackService.mediaItemOf(u, titles.getOrNull(i) ?: "") }
+        // Lets the service append files that land in this folder later (auto-advance keeps going).
+        PlaybackService.sourceDir = intent.getStringExtra(EXTRA_DIR)?.ifEmpty { null }
+        PlaybackService.sourceSet = intent.hasExtra(EXTRA_DIR)
         c.setMediaItems(items, index, start)
         c.prepare()
         c.play()
@@ -208,6 +207,8 @@ class PlayerActivity : ComponentActivity() {
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         playerView.useController = !isInPictureInPictureMode
+        ViewCompat.getRootWindowInsets(playerView)?.let { applyControllerInsets(it) }
+        ViewCompat.requestApplyInsets(playerView)
         SleepTimer.playerInPip = isInPictureInPictureMode
         if (!isInPictureInPictureMode) SleepTimer.playerLeftPipAt = android.os.SystemClock.elapsedRealtime()
         if (isInPictureInPictureMode) {
@@ -263,6 +264,20 @@ class PlayerActivity : ComponentActivity() {
         closeSelf()
     }
 
+    private fun applyControllerInsets(insets: WindowInsetsCompat) {
+        val ctrl = playerView.findViewById<View>(androidx.media3.ui.R.id.exo_controller) ?: return
+        if (isInPictureInPictureMode) {
+            ctrl.setPadding(0, 0, 0, 0)
+            return
+        }
+        val bars = insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.systemBars())
+        val cut = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
+        ctrl.setPadding(
+            maxOf(bars.left, cut.left), maxOf(bars.top, cut.top),
+            maxOf(bars.right, cut.right), maxOf(bars.bottom, cut.bottom)
+        )
+    }
+
     private fun goImmersive() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val c = WindowInsetsControllerCompat(window, window.decorView)
@@ -300,12 +315,14 @@ class PlayerActivity : ComponentActivity() {
         const val EXTRA_URIS = "uris"
         const val EXTRA_TITLES = "titles"
         const val EXTRA_INDEX = "index"
+        const val EXTRA_DIR = "dir"
 
         fun start(ctx: Context, items: List<VideoItem>, index: Int) {
             val i = Intent(ctx, PlayerActivity::class.java)
                 .putStringArrayListExtra(EXTRA_URIS, ArrayList(items.map { it.key }))
                 .putStringArrayListExtra(EXTRA_TITLES, ArrayList(items.map { it.title }))
                 .putExtra(EXTRA_INDEX, index)
+                .putExtra(EXTRA_DIR, items.getOrNull(index)?.dir ?: "")
             ctx.startActivity(i)
         }
     }

@@ -2,6 +2,9 @@ package com.sleeptube
 
 import android.Manifest
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -149,7 +152,7 @@ class MainActivity : ComponentActivity() {
         refreshTick.intValue++
         if (folderOk.value) {
             consumePendingUrl()
-            if (Subs.enqueueDueChecks()) DownloadService.start(this)
+            if (Subs.enqueueDueChecks(this)) DownloadService.start(this)
             DownloadService.resumeIfNeeded(this)
         }
         if (installAfterPermission && Updater.canInstall(this)) {
@@ -160,6 +163,45 @@ class MainActivity : ComponentActivity() {
             val r = withContext(Dispatchers.IO) { Updater.checkIfDue() }
             if (r is Updater.Result.Available) update.value = r
         }
+    }
+
+    // While the app is on screen, a (re)connection resumes deferred downloads / due checks.
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    override fun onStart() {
+        super.onStart()
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                // Debounce: capability changes come in bursts; act once things settle.
+                netHandler.removeCallbacks(netRunnable)
+                netHandler.postDelayed(netRunnable, 2000)
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+        } catch (_: Exception) {}
+    }
+
+    override fun onStop() {
+        netCallback?.let {
+            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}
+        }
+        netCallback = null
+        netHandler.removeCallbacks(netRunnable)
+        super.onStop()
+    }
+
+    private val netHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val netRunnable = Runnable { onNetworkChanged() }
+
+    private fun onNetworkChanged() {
+        // Only while visible (starting a foreground service from the background isn't allowed).
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
+        if (!VideoRepo.hasFolderAccess(this)) return
+        if (Subs.enqueueDueChecks(this)) DownloadService.start(this)
+        DownloadService.resumeIfNeeded(this)
     }
 
     /** Settings button: explicit check with feedback. */
