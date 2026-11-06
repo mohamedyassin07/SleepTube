@@ -4,7 +4,11 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 
-/** Network rules for downloads and subscription checks. */
+/**
+ * Network rules for every download (shared videos, playlists incl. expansion, subscription
+ * checks and their downloads) and for the yt-dlp / app self-updates:
+ * validated internet is required, and with "التحميل على Wi-Fi بس" on, an unmetered/Wi-Fi network.
+ */
 object Net {
     enum class State { NONE, METERED, UNMETERED }
 
@@ -23,32 +27,29 @@ object Net {
         }
     }
 
-    /** Subscription checks/downloads: need validated internet, and Wi-Fi/unmetered if the setting is on. */
-    fun subsAllowed(s: State): Boolean = when (s) {
+    fun allowed(s: State): Boolean = when (s) {
         State.NONE -> false
-        State.METERED -> !Prefs.subsWifiOnly
+        State.METERED -> !Prefs.wifiOnly
         State.UNMETERED -> true
     }
 
-    fun subsAllowed(ctx: Context): Boolean = subsAllowed(state(ctx))
+    fun allowed(ctx: Context): Boolean = allowed(state(ctx))
 
-    /** Arabic reason why subscription work can't run now, or null if it can. */
-    fun subsBlockedReason(ctx: Context): String? = when (state(ctx)) {
+    /** Arabic reason why downloads can't run now, or null if they can. */
+    fun blockedReason(ctx: Context): String? = blockedReason(state(ctx))
+
+    fun blockedReason(s: State): String? = when (s) {
         State.NONE -> "مفيش إنترنت"
-        State.METERED -> if (Prefs.subsWifiOnly) "مستني Wi-Fi" else null
+        State.METERED -> if (Prefs.wifiOnly) "مستني Wi-Fi" else null
         State.UNMETERED -> null
     }
 
-    /** Whether a queue item may run on the current connection. */
-    fun eligible(ctx: Context, item: QueueItem, s: State = state(ctx)): Boolean {
-        if (s == State.NONE) return false
-        if (item.isSubCheck || item.sub != null) return subsAllowed(s)
-        return true
-    }
+    /** Whether a queue item may run on the current connection (same rule for every kind). */
+    @Suppress("UNUSED_PARAMETER")
+    fun eligible(ctx: Context, item: QueueItem, s: State = state(ctx)): Boolean = allowed(s)
 
     fun nextEligible(ctx: Context): QueueItem? {
-        val s = state(ctx)
-        if (s == State.NONE) return null
-        return Prefs.queue().firstOrNull { eligible(ctx, it, s) }
+        if (!allowed(ctx)) return null
+        return Prefs.queueHead()
     }
 }

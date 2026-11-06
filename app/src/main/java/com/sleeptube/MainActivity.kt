@@ -62,6 +62,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -69,6 +70,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -86,6 +88,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -160,6 +169,7 @@ class MainActivity : ComponentActivity() {
             startUpdate()
         }
         lifecycleScope.launch {
+            if (!Net.allowed(this@MainActivity)) return@launch // try again on a later open
             val r = withContext(Dispatchers.IO) { Updater.checkIfDue() }
             if (r is Updater.Result.Available) update.value = r
         }
@@ -197,6 +207,7 @@ class MainActivity : ComponentActivity() {
     private val netRunnable = Runnable { onNetworkChanged() }
 
     private fun onNetworkChanged() {
+        refreshTick.intValue++
         // Only while visible (starting a foreground service from the background isn't allowed).
         if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
         if (!VideoRepo.hasFolderAccess(this)) return
@@ -217,9 +228,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startUpdate() {
+    private val confirmMeteredUpdate = mutableStateOf(false)
+
+    private fun startUpdate(confirmedMetered: Boolean = false) {
         val u = update.value ?: return
         if (updateProgress.value != null) return
+        when (Net.state(this)) {
+            Net.State.NONE -> {
+                Toast.makeText(this, "مفيش إنترنت", Toast.LENGTH_SHORT).show()
+                return
+            }
+            Net.State.METERED -> if (Prefs.wifiOnly && !confirmedMetered) {
+                confirmMeteredUpdate.value = true
+                return
+            }
+            Net.State.UNMETERED -> {}
+        }
         if (!Updater.canInstall(this)) {
             installAfterPermission = true
             Toast.makeText(this, "اسمح لـ SleepTube بتثبيت التحديثات وارجع", Toast.LENGTH_LONG).show()
@@ -259,6 +283,28 @@ class MainActivity : ComponentActivity() {
                 label = { Text("المتابعة") }
             )
         }
+    }
+
+    @Composable
+    private fun MeteredUpdateDialog() {
+        val show by confirmMeteredUpdate
+        if (!show) return
+        val size = update.value?.size ?: 0L
+        val mb = if (size > 0) "%.1f".format(java.util.Locale.US, size / 1048576.0) + " ميجا" else "حجمه مش معروف"
+        AlertDialog(
+            onDismissRequest = { confirmMeteredUpdate.value = false },
+            title = { Text("انت على نت موبايل") },
+            text = { Text("التحديث ($mb). تحمله دلوقتي على نت الموبايل؟") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmMeteredUpdate.value = false
+                    startUpdate(confirmedMetered = true)
+                }) { Text("حمّل") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmMeteredUpdate.value = false }) { Text("استنى Wi-Fi") }
+            }
+        )
     }
 
     @Composable
@@ -329,6 +375,7 @@ class MainActivity : ComponentActivity() {
         val t by tab
         val remaining by SleepTimer.remaining.collectAsState()
         val prefill by pendingSubUrl
+        MeteredUpdateDialog()
 
         when {
             !ok -> Onboarding { pickFolder.launch(Prefs.folderUri) }
@@ -379,16 +426,19 @@ class MainActivity : ComponentActivity() {
         var openName by remember { mutableStateOf("") }
         val folders = remember { mutableStateListOf<FolderItem>() }
         val items = remember { mutableStateListOf<VideoItem>() }
+        val entries = remember { mutableStateListOf<LibEntry>() } // what is shown, in order
         LaunchedEffect(tick, openDir) {
             val dir = openDir
             if (dir == null) {
-                val (f, v) = withContext(Dispatchers.IO) { VideoRepo.listAll(ctx) }
-                folders.clear(); folders.addAll(f)
-                items.clear(); items.addAll(v)
+                val lib = withContext(Dispatchers.IO) { VideoRepo.library(ctx) }
+                folders.clear(); folders.addAll(lib.mapNotNull { (it as? LibEntry.Folder)?.folder })
+                items.clear(); items.addAll(lib.mapNotNull { (it as? LibEntry.Video)?.video })
+                entries.clear(); entries.addAll(lib)
             } else {
                 val v = withContext(Dispatchers.IO) { VideoRepo.list(ctx, dir) }
                 folders.clear()
                 items.clear(); items.addAll(v)
+                entries.clear(); entries.addAll(v.map { LibEntry.Video(it, 0L) })
             }
         }
         val selected = remember { mutableStateListOf<String>() }
@@ -470,6 +520,20 @@ class MainActivity : ComponentActivity() {
                 item(key = "__update") { UpdateBanner() }
                 if (dl.active) {
                     item(key = "__download") { DownloadCard(dl) }
+                } else {
+                    val waiting = remember(tick, dl) {
+                        val n = Prefs.queueSize()
+                        val r = Net.blockedReason(ctx)
+                        if (n > 0 && r != null) "$r • في الطابور $n" else null
+                    }
+                    if (waiting != null) item(key = "__waiting") {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                        ) {
+                            Text(waiting, modifier = Modifier.padding(12.dp), fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
                 if (items.isEmpty() && folders.isEmpty()) {
                     item(key = "__empty") {
@@ -480,33 +544,33 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
-                items(folders, key = { it.key }) { f ->
-                    val isSel = f.key in selected
-                    FolderRow(
-                        f, tick, isSel,
-                        modifier = Modifier.combinedClickable(
-                            onClick = {
-                                if (selecting) toggle(f.key) else {
-                                    openName = f.name
-                                    openDir = f.docId
-                                }
-                            },
-                            onLongClick = { if (!isSel) selected.add(f.key) }
+                items(entries, key = { it.key }) { e ->
+                    val isSel = e.key in selected
+                    when (e) {
+                        is LibEntry.Folder -> FolderRow(
+                            e.folder, tick, isSel,
+                            modifier = Modifier.combinedClickable(
+                                onClick = {
+                                    if (selecting) toggle(e.key) else {
+                                        openName = e.folder.name
+                                        openDir = e.folder.docId
+                                    }
+                                },
+                                onLongClick = { if (!isSel) selected.add(e.key) }
+                            )
                         )
-                    )
-                }
-                items(items, key = { it.key }) { v ->
-                    val isSel = v.key in selected
-                    VideoRow(
-                        v, tick, isSel,
-                        modifier = Modifier.combinedClickable(
-                            onClick = {
-                                if (selecting) toggle(v.key)
-                                else PlayerActivity.start(ctx, items.toList(), items.indexOf(v))
-                            },
-                            onLongClick = { if (!isSel) selected.add(v.key) }
+                        is LibEntry.Video -> VideoRow(
+                            e.video, tick, isSel,
+                            modifier = Modifier.combinedClickable(
+                                onClick = {
+                                    if (selecting) toggle(e.key)
+                                    // Root: the root videos in list order; folder: that folder.
+                                    else PlayerActivity.start(ctx, items.toList(), items.indexOf(e.video))
+                                },
+                                onLongClick = { if (!isSel) selected.add(e.key) }
+                            )
                         )
-                    )
+                    }
                 }
             }
         }
@@ -719,28 +783,61 @@ class MainActivity : ComponentActivity() {
                 HorizontalDivider()
                 Spacer(Modifier.height(16.dp))
 
+                var wifiOnly by remember { mutableStateOf(Prefs.wifiOnly) }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("التحميل على Wi-Fi بس", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "كل التحميلات (اللينكات، البلاي ليست، المتابعة) والتحديثات بتستنى Wi-Fi.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = wifiOnly, onCheckedChange = {
+                        wifiOnly = it
+                        Prefs.wifiOnly = it
+                        refreshTick.intValue++
+                        if (!it) DownloadService.resumeIfNeeded(ctx)
+                    })
+                }
+
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(16.dp))
+
                 Text("مؤقت النوم", style = MaterialTheme.typography.titleMedium)
                 Text(
                     "التطبيق بيقفل لوحده بعد المدة دي من وقت ما تفتحه.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(4.dp))
-                Prefs.TIMER_CHOICES.forEach { m ->
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .selectable(selected = m == minutes, role = Role.RadioButton) {
-                                minutes = m
-                                Prefs.timerMinutes = m
-                            }
-                            .padding(vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(selected = m == minutes, onClick = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("$m دقيقة")
+                Spacer(Modifier.height(8.dp))
+                var timerText by remember { mutableStateOf(Prefs.timerMinutes.toString()) }
+                var timerError by remember { mutableStateOf<String?>(null) }
+                val focus = LocalFocusManager.current
+                // Saves only a whole number 1..600; otherwise keeps the previous value and says why.
+                fun commitTimer() {
+                    val v = timerText.trim().toIntOrNull()
+                    if (v != null && v in 1..600) {
+                        if (v != Prefs.timerMinutes) Prefs.timerMinutes = v // countdown picks it up next tick
+                        minutes = v
+                        timerError = null
+                    } else {
+                        timerError = "اكتب رقم صحيح من 1 لـ 600 (اتساب $minutes)"
                     }
                 }
+                DisposableEffect(Unit) { onDispose { commitTimer() } } // leaving the screen
+                OutlinedTextField(
+                    value = timerText,
+                    onValueChange = { timerText = it.filter(Char::isDigit).take(3); timerError = null },
+                    label = { Text("مؤقت النوم (بالدقايق)") },
+                    singleLine = true,
+                    isError = timerError != null,
+                    supportingText = timerError?.let { e -> { Text(e) } },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { commitTimer(); focus.clearFocus() }),
+                    modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) commitTimer() }
+                )
 
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider()
@@ -750,6 +847,11 @@ class MainActivity : ComponentActivity() {
                 Text("النسخة: ${version ?: "…"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
                 Button(enabled = !updating, onClick = {
+                    val blocked = Net.blockedReason(ctx)
+                    if (blocked != null) {
+                        updateMsg = blocked
+                        return@Button
+                    }
                     updating = true
                     updateMsg = "بيحدث…"
                     scope.launch {

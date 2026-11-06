@@ -29,6 +29,7 @@ object Ytdl {
     /** Updates if the last update attempt is older than [maxAgeMs]. Returns true if updated. */
     fun updateIfStale(ctx: Context, maxAgeMs: Long): Boolean {
         if (System.currentTimeMillis() - Prefs.lastUpdate < maxAgeMs) return false
+        if (!Net.allowed(ctx)) return false // no internet, or Wi-Fi only and on mobile data
         return try {
             update(ctx)
             true

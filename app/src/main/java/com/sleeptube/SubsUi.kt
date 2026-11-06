@@ -75,7 +75,7 @@ private fun kick(ctx: Context, queued: Boolean) {
 
 /** Manual check: only with (Wi-Fi) internet, otherwise tell the user why. */
 private fun manualCheck(ctx: Context, enqueue: () -> Boolean) {
-    val reason = Net.subsBlockedReason(ctx)
+    val reason = Net.blockedReason(ctx)
     if (reason != null) {
         Toast.makeText(ctx, reason, Toast.LENGTH_SHORT).show()
         return
@@ -143,28 +143,6 @@ fun SubsScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            item(key = "__wifi") {
-                var wifiOnly by remember { mutableStateOf(Prefs.subsWifiOnly) }
-                Row(
-                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("تحميل المتابعة على Wi-Fi بس", color = MaterialTheme.colorScheme.onBackground)
-                        Text(
-                            "اللينكات اللي بتعملها Share بتتحمل على أي نت.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(checked = wifiOnly, onCheckedChange = {
-                        wifiOnly = it
-                        Prefs.subsWifiOnly = it
-                        if (!it) DownloadService.resumeIfNeeded(ctx)
-                    })
-                }
-                HorizontalDivider()
-            }
             if (subs.isEmpty()) item {
                 Text(
                     "مش متابع أي قناة. دوس + وحط لينك القناة، أو اعمل Share للينك قناة من يوتيوب.",
@@ -311,8 +289,9 @@ private fun SubDialog(
                         error = "مقدرتش أوصل للقناة. اتأكد من اللينك والنت."
                     } else {
                         Subs.upsert(Sub(r.id, r.name, Subs.canonicalUrl(r.id), start, keyword.trim()))
-                        if (Net.subsAllowed(ctx)) kick(ctx, Subs.enqueueCheck(r.id))
-                        else Toast.makeText(ctx, "اتضافت. هتتحقق لما يبقى فيه Wi-Fi", Toast.LENGTH_SHORT).show()
+                        val reason = Net.blockedReason(ctx)
+                        if (reason == null) kick(ctx, Subs.enqueueCheck(r.id))
+                        else Toast.makeText(ctx, "اتضافت. هتتحقق بعدين ($reason)", Toast.LENGTH_SHORT).show()
                         onSaved()
                     }
                 }

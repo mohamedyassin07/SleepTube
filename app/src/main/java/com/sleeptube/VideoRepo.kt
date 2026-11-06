@@ -39,6 +39,23 @@ data class FolderItem(
     val count: Int get() = videos.size
 }
 
+/** One row of the main list: a folder or a root video, with its "added" time for ordering. */
+sealed class LibEntry {
+    abstract val key: String
+    abstract val added: Long
+    abstract val sortName: String
+
+    data class Folder(val folder: FolderItem, override val added: Long) : LibEntry() {
+        override val key: String get() = folder.key
+        override val sortName: String get() = folder.name
+    }
+
+    data class Video(val video: VideoItem, override val added: Long) : LibEntry() {
+        override val key: String get() = video.key
+        override val sortName: String get() = video.name
+    }
+}
+
 object VideoRepo {
     val VIDEO_EXT = setOf("mp4", "webm", "mkv", "3gp", "mov", "m4v", "avi", "ts")
     val AUDIO_EXT = setOf("m4a", "mp3", "opus", "ogg", "aac", "wav", "flac", "weba")
@@ -144,8 +161,30 @@ object VideoRepo {
                 )
             }
 
-    private fun sortRoot(items: List<VideoItem>) =
-        items.sortedWith(compareBy<VideoItem>({ it.modified }, { it.name }))
+    /**
+     * When each file was added to the library. Recorded when a download is saved; files found
+     * without one (added by hand, older builds) get their lastModified once, persisted, so the
+     * order stays stable even if the file's modified time changes later.
+     */
+    private fun addedTimes(items: List<VideoItem>): Map<String, Long> {
+        val out = HashMap<String, Long>(items.size)
+        val missing = HashMap<String, Long>()
+        items.forEach {
+            var t = Prefs.added(it.key)
+            if (t <= 0L) {
+                t = if (it.modified > 0) it.modified else System.currentTimeMillis()
+                missing[it.key] = t
+            }
+            out[it.key] = t
+        }
+        Prefs.setAddedAll(missing)
+        return out
+    }
+
+    private fun sortRoot(items: List<VideoItem>): List<VideoItem> {
+        val t = addedTimes(items)
+        return items.sortedWith(compareBy<VideoItem>({ t[it.key] ?: 0L }, { it.name }))
+    }
 
     private fun sortFolder(items: List<VideoItem>) =
         items.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it: VideoItem -> it.name })
@@ -158,6 +197,22 @@ object VideoRepo {
         val tree = Prefs.folderUri ?: return emptyList()
         val items = mediaOf(tree, queryChildren(ctx, tree, dir ?: rootDocId(tree)), dir)
         return if (dir == null) sortRoot(items) else sortFolder(items)
+    }
+
+    /**
+     * The main list: root videos and folders mixed, oldest added first. A folder counts from the
+     * added time of its earliest-added video; its contents keep their own (name) order.
+     */
+    fun library(ctx: Context): List<LibEntry> {
+        val (folders, root) = listAll(ctx)
+        val rootTimes = addedTimes(root)
+        val entries = ArrayList<LibEntry>(folders.size + root.size)
+        folders.forEach { f ->
+            val first = addedTimes(f.videos).values.minOrNull() ?: Long.MAX_VALUE
+            entries.add(LibEntry.Folder(f, first))
+        }
+        root.forEach { entries.add(LibEntry.Video(it, rootTimes[it.key] ?: 0L)) }
+        return entries.sortedWith(compareBy<LibEntry>({ it.added }, { it.sortName }))
     }
 
     /** Subfolders that contain media (sorted by name) and the root videos. */
@@ -206,6 +261,7 @@ object VideoRepo {
         val cr = ctx.contentResolver
         val uri = DocumentsContract.createDocument(cr, parent, "application/octet-stream", displayName)
             ?: throw IllegalStateException("createDocument failed")
+        Prefs.setAdded(uri.toString(), System.currentTimeMillis())
         try {
             cr.openOutputStream(uri, "w")?.use { os ->
                 file.inputStream().use { it.copyTo(os, 256 * 1024) }

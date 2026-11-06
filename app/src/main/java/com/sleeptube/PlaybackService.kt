@@ -146,43 +146,106 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            // A broken/missing file must not stop the night: skip to the next one.
+            // A broken/missing file must not stop the night: skip to the next one, or when it was
+            // the last of the list, continue elsewhere in the library. Never auto-pick it again.
+            val bad = player.currentMediaItem?.mediaId
+            bad?.let { sessionSkip.add(it) }
             if (player.hasNextMediaItem()) {
                 player.seekToNextMediaItem()
                 player.prepare()
                 player.play()
+            } else {
+                val gen = playGen
+                scope.launch { continueFromLibrary(bad, gen) }
             }
         }
     }
 
     private var resumedId: String? = null
 
+    /** Items auto-picked (or failed) this session; never auto-picked again, so no loops. Main thread. */
+    private val sessionSkip = HashSet<String>()
+
+    /** Bumped by shutdown(); async continuations started before it must not restart playback. */
+    private var playGen = 0
+
     /**
      * Appends media files from the folder the list came from that sort after the current item
-     * and aren't in the player yet. If playback had ended, continues with the first new one.
+     * and aren't in the player yet. If playback had ended: continue with the first new one, or
+     * when there is none, with the first unfinished video of the whole library.
      */
     private fun appendNewFromSource(continueIfEnded: Boolean) {
-        if (!sourceSet) return
+        val hasSource = sourceSet
         val dir = sourceDir
+        val gen = playGen
         scope.launch {
-            val list = withContext(Dispatchers.IO) {
+            val list = if (!hasSource) emptyList() else withContext(Dispatchers.IO) {
                 try { VideoRepo.list(this@PlaybackService, dir) } catch (_: Exception) { emptyList() }
             }
+            if (gen != playGen) return@launch
             val curId = player.currentMediaItem?.mediaId ?: return@launch
             val present = (0 until player.mediaItemCount).map { player.getMediaItemAt(it).mediaId }.toHashSet()
             val idx = list.indexOfFirst { it.key == curId }
-            if (idx < 0) return@launch
-            val fresh = list.drop(idx + 1).filter { it.key !in present }
-            if (fresh.isEmpty()) return@launch
+            val fresh = if (idx < 0) emptyList() else list.drop(idx + 1).filter { it.key !in present }
             val ended = player.playbackState == Player.STATE_ENDED
-            val firstNew = player.mediaItemCount
-            player.addMediaItems(fresh.map { mediaItemOf(it.key, it.title) })
-            if (continueIfEnded && ended) {
-                player.seekTo(firstNew, Prefs.startPosition(fresh[0].key))
-                player.prepare()
-                player.play()
+            if (fresh.isNotEmpty()) {
+                val firstNew = player.mediaItemCount
+                player.addMediaItems(fresh.map { mediaItemOf(it.key, it.title) })
+                if (continueIfEnded && ended) {
+                    player.seekTo(firstNew, Prefs.startPosition(fresh[0].key))
+                    player.prepare()
+                    player.play()
+                }
+                return@launch
             }
+            if (continueIfEnded && ended) continueFromLibrary(curId, gen)
         }
+    }
+
+    /**
+     * The current list ran out: search the whole library in main-list order (folders in their
+     * displayed order with their videos in folder order, then the root videos) from the top and
+     * play the first video that isn't finished, resuming it, with its own folder (or the root
+     * list) as the new queue. Stops (does nothing) if there is none.
+     */
+    private suspend fun continueFromLibrary(justEnded: String?, gen: Int) {
+        justEnded?.let { sessionSkip.add(it) }
+        val skip = HashSet(sessionSkip)
+        val pick = withContext(Dispatchers.IO) {
+            try {
+                // Same mixed order as the main list (by added time). A root video's context is the
+                // whole root list, so auto-advance continues there.
+                val lib = VideoRepo.library(this@PlaybackService)
+                val root = lib.mapNotNull { (it as? LibEntry.Video)?.video }
+                var found: Triple<String?, List<VideoItem>, Int>? = null
+                for (e in lib) {
+                    when (e) {
+                        is LibEntry.Folder -> {
+                            val vids = e.folder.videos
+                            val i = vids.indexOfFirst { it.key !in skip && !Prefs.finished(it.key) }
+                            if (i >= 0) found = Triple(e.folder.docId, vids, i)
+                        }
+                        is LibEntry.Video -> {
+                            val v = e.video
+                            if (v.key !in skip && !Prefs.finished(v.key)) found = Triple(null, root, root.indexOf(v))
+                        }
+                    }
+                    if (found != null) break
+                }
+                found
+            } catch (_: Exception) { null }
+        } ?: return
+        if (gen != playGen) return // sleep timer / full close happened meanwhile
+        // Only if nothing else started meanwhile (still ended, or stuck on an error).
+        if (player.playbackState != Player.STATE_ENDED && player.playerError == null) return
+        val (dir, vids, i) = pick
+        val target = vids[i]
+        sessionSkip.add(target.key)
+        sourceDir = dir
+        sourceSet = true
+        player.setMediaItems(vids.map { mediaItemOf(it.key, it.title) }, i, Prefs.startPosition(target.key))
+        player.prepare()
+        player.play()
     }
 
     private fun startSaving() {
@@ -209,6 +272,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun shutdown() {
+        playGen++
         saveCurrent()
         saveJob?.cancel()
         player.pause()

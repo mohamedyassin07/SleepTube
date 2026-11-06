@@ -83,7 +83,23 @@ object Prefs {
     }
 
     fun forget(uri: String) {
-        sp.edit().remove(posKey(uri)).remove(durKey(uri)).remove(finKey(uri)).apply()
+        sp.edit().remove(posKey(uri)).remove(durKey(uri)).remove(finKey(uri)).remove(addedKey(uri)).apply()
+    }
+
+    // ---- stable "added to the library" time per file (list order) ----
+    private fun addedKey(uri: String) = "added:$uri"
+
+    /** Stored added time, or 0 if none yet. */
+    fun added(uri: String): Long = sp.getLong(addedKey(uri), 0L)
+
+    fun setAdded(uri: String, time: Long) { sp.edit().putLong(addedKey(uri), time).apply() }
+
+    /** Persists added times for several files in one write. */
+    fun setAddedAll(times: Map<String, Long>) {
+        if (times.isEmpty()) return
+        val e = sp.edit()
+        times.forEach { (k, v) -> e.putLong(addedKey(k), v) }
+        e.apply()
     }
 
     // ---- persisted download queue ----
@@ -168,8 +184,11 @@ object Prefs {
 
     @Synchronized fun clearQueue() { writeQueue(emptyList()) }
 
-    /** Subscription checks and their downloads only on Wi-Fi / unmetered networks. */
-    var subsWifiOnly: Boolean
+    /**
+     * All downloads (shared links, playlists, subscriptions) and self-updates only on Wi-Fi /
+     * unmetered networks. Same key as the earlier subscriptions-only switch, so the value carries over.
+     */
+    var wifiOnly: Boolean
         get() = sp.getBoolean("subs_wifi_only", true)
         set(v) { sp.edit().putBoolean("subs_wifi_only", v).apply() }
 

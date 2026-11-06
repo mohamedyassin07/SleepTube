@@ -107,6 +107,7 @@ class DownloadService : Service() {
         }
         loopRunning = true
         startRequestedWhileRunning = false
+        getSystemService(NotificationManager::class.java).cancel(NOTIF_WAITING)
         scope.launch {
             val halted = withContext(Dispatchers.IO) {
                 try { runQueue() } finally { releaseLocks() }
@@ -130,6 +131,7 @@ class DownloadService : Service() {
 
     private fun finish() {
         _state.value = DlState(queued = Prefs.queueSize())
+        updateWaitingNotification()
         releaseLocks()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -478,6 +480,30 @@ class DownloadService : Service() {
         nm.notify(NOTIF_PROGRESS, buildProgressNotification(s.title ?: "بيحمل…", s.progress, s.etaSec, s.queued))
     }
 
+    /** Queue left but blocked by the network rule: say so, so the user knows why nothing happens. */
+    private fun updateWaitingNotification() {
+        val nm = getSystemService(NotificationManager::class.java)
+        val left = Prefs.queueSize()
+        val reason = Net.blockedReason(this)
+        if (left == 0 || reason == null) {
+            nm.cancel(NOTIF_WAITING)
+            return
+        }
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val n = NotificationCompat.Builder(this, App.CH_PROGRESS)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(reason)
+            .setContentText("في الطابور $left • هيكمل لوحده لما تفتح التطبيق والنت يسمح")
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(open)
+            .build()
+        try { nm.notify(NOTIF_WAITING, n) } catch (_: SecurityException) {}
+    }
+
     private fun buildProgressNotification(title: String, progress: Float, eta: Long, queued: Int): Notification {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
@@ -559,6 +585,7 @@ class DownloadService : Service() {
         private const val ACTION_CANCEL = "com.sleeptube.CANCEL"
         private const val ACTION_CANCEL_ALL = "com.sleeptube.CANCEL_ALL"
         private const val NOTIF_PROGRESS = 1001
+        private const val NOTIF_WAITING = 1002
         private const val LOCK_TIMEOUT_MS = 60 * 60 * 1000L
         private const val MAX_CONSECUTIVE_FAILURES = 3
         private const val SUB_SCAN_LIMIT = 100

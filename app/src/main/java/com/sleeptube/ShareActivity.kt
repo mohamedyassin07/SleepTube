@@ -56,7 +56,12 @@ class ShareActivity : Activity() {
         }
         Prefs.enqueue(QueueItem(url))
         DownloadService.start(this)
-        Toast.makeText(this, "اتضاف للتحميل", Toast.LENGTH_SHORT).show()
+        val msg = when (Net.blockedReason(this)) {
+            null -> "اتضاف للتحميل"
+            "مستني Wi-Fi" -> "اتضاف للتحميل، مستني Wi-Fi"
+            else -> "اتضاف للتحميل، مستني إنترنت"
+        }
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
     companion object {

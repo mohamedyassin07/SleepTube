@@ -146,7 +146,7 @@ object Subs {
     /** Queues checks for subscriptions not checked in the last 24h. Returns true if any was queued. */
     fun enqueueDueChecks(ctx: Context): Boolean {
         // No (Wi-Fi) internet: skip silently; nothing is marked, so it runs next time.
-        if (!Net.subsAllowed(ctx)) return false
+        if (!Net.allowed(ctx)) return false
         val now = System.currentTimeMillis()
         var any = false
         all().forEach {
