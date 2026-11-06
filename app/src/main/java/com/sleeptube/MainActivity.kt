@@ -451,6 +451,13 @@ class MainActivity : ComponentActivity() {
             if (key in selected) selected.remove(key) else selected.add(key)
         }
 
+        // Queue blocked by the network rule: say why nothing is downloading.
+        val waiting = remember(tick, dl) {
+            val n = Prefs.queueSize()
+            val r = Net.blockedReason(ctx)
+            if (n > 0 && r != null) "$r • في الطابور $n" else null
+        }
+
         BackHandler(enabled = selecting) { selected.clear() }
         BackHandler(enabled = !selecting && openDir != null) { openDir = null }
 
@@ -521,11 +528,6 @@ class MainActivity : ComponentActivity() {
                 if (dl.active) {
                     item(key = "__download") { DownloadCard(dl) }
                 } else {
-                    val waiting = remember(tick, dl) {
-                        val n = Prefs.queueSize()
-                        val r = Net.blockedReason(ctx)
-                        if (n > 0 && r != null) "$r • في الطابور $n" else null
-                    }
                     if (waiting != null) item(key = "__waiting") {
                         Card(
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
