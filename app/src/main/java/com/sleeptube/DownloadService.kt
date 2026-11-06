@@ -223,8 +223,10 @@ class DownloadService : Service() {
         if (vid != null && VideoRepo.existsId(this, vid, item.dir)) return true
 
         updateState(DlState(true, vid ?: url, 0f, -1, Prefs.queueSize()), force = true)
-        val tmp = File(cacheDir, "dl/" + SystemClock.elapsedRealtime()).apply {
-            deleteRecursively(); mkdirs()
+        val tmp = File(cacheDir, "dl/" + SystemClock.elapsedRealtime())
+        if (!tmp.deleteTreeOrWarn() || !tmp.ensureDir()) {
+            notifyResult("فشل التحميل", "مقدرتش أجهز فولدر مؤقت")
+            return false
         }
         try {
             var ok = false
@@ -242,7 +244,7 @@ class DownloadService : Service() {
                     if (attempt == 0 && System.currentTimeMillis() - Prefs.lastUpdate > 3600_000L) {
                         updateState(_state.value.copy(title = "بيحدث yt-dlp…"), force = true)
                         if (!Ytdl.updateIfStale(this, 3600_000L)) break
-                        tmp.listFiles()?.forEach { it.deleteRecursively() }
+                        tmp.listFiles()?.forEach { it.deleteTreeOrWarn() }
                     } else break
                 }
             }
@@ -274,7 +276,7 @@ class DownloadService : Service() {
             notifyResult("خلص التحميل", title)
             return true
         } finally {
-            tmp.deleteRecursively()
+            tmp.deleteTreeOrWarn()
         }
     }
 

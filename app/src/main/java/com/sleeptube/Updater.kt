@@ -85,7 +85,8 @@ object Updater {
 
     /** Downloads the APK to cache with progress (0..1). Blocking. */
     fun download(ctx: Context, url: String, onProgress: (Float) -> Unit): File {
-        val dir = File(ctx.cacheDir, "updates").apply { mkdirs() }
+        val dir = File(ctx.cacheDir, "updates")
+        if (!dir.ensureDir()) throw IllegalStateException("cannot create ${dir.path}")
         val out = File(dir, "SleepTube.apk")
         val tmp = File(dir, "SleepTube.apk.part")
         val c = URL(url).openConnection() as HttpURLConnection
@@ -113,7 +114,7 @@ object Updater {
         } finally {
             c.disconnect()
         }
-        out.delete()
+        if (!out.deleteOrWarn()) throw IllegalStateException("cannot replace ${out.path}")
         if (!tmp.renameTo(out)) throw IllegalStateException("rename failed")
         return out
     }

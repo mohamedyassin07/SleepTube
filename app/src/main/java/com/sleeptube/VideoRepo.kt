@@ -222,7 +222,7 @@ object VideoRepo {
         folder.videos.forEach {
             Prefs.forget(it.key)
             memCache.remove(it.key)
-            thumbFile(ctx, it).delete()
+            thumbFile(ctx, it).deleteOrWarn()
         }
         val ok = try {
             DocumentsContract.deleteDocument(ctx.contentResolver, folder.uri)
@@ -238,13 +238,15 @@ object VideoRepo {
         if (ok) {
             Prefs.forget(item.key)
             memCache.remove(item.key)
-            thumbFile(ctx, item).delete()
+            thumbFile(ctx, item).deleteOrWarn()
         }
         return ok
     }
 
     private fun thumbFile(ctx: Context, item: VideoItem): File {
-        val dir = File(ctx.cacheDir, "thumbs").apply { mkdirs() }
+        val dir = File(ctx.cacheDir, "thumbs")
+        // Without the cache dir the thumbnail is still shown, it just isn't cached on disk.
+        dir.ensureDir()
         val h = (item.key.hashCode().toLong() and 0xffffffffL).toString(16)
         return File(dir, "${h}_${item.size}.jpg")
     }
